@@ -477,6 +477,48 @@ function setupTabs() {
   });
 }
 
+/** Bild vorverarbeiten: Graustufen + höherer Kontrast + leichte Schärfung */
+function preprocessImage(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      // Maximale Kantenlänge begrenzen (schnellere OCR, oft bessere Ergebnisse)
+      const maxSide = 1600;
+      let w = img.width;
+      let h = img.height;
+      if (w > maxSide || h > maxSide) {
+        const scale = maxSide / Math.max(w, h);
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+      }
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+
+      const imageData = ctx.getImageData(0, 0, w, h);
+      const d = imageData.data;
+
+      // Graustufen + Kontrast erhöhen
+      const contrast = 1.4; // >1 = mehr Kontrast
+      const intercept = 128 * (1 - contrast);
+      for (let i = 0; i < d.length; i += 4) {
+        // Graustufe
+        let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        // Kontrast
+        gray = contrast * gray + intercept;
+        gray = Math.max(0, Math.min(255, gray));
+        d[i] = d[i + 1] = d[i + 2] = gray;
+      }
+      ctx.putImageData(imageData, 0, 0);
+      resolve(canvas.toDataURL('image/jpeg', 0.92));
+    };
+    img.onerror = () => resolve(dataUrl); // Fallback: Original
+    img.src = dataUrl;
+  });
+}
+
 function setupUpload() {
   const input = $('receipt-input');
   const area = $('upload-area');
@@ -496,32 +538,36 @@ function setupUpload() {
       preview.classList.remove('hidden');
       placeholder.classList.add('hidden');
 
-      // OCR starten – unterstützt Deutsch, Englisch und Arabisch (für saudische/arabische Bons)
+      // OCR starten
       show($('ocr-status'));
-      $('ocr-text').textContent = 'Analysiere Quittung… (lädt Sprachmodell)';
+      $('ocr-text').textContent = 'Bild wird vorbereitet…';
       try {
-        // ara = Arabisch, eng = Englisch, deu = Deutsch
-        // Tesseract lädt die Modelle bei Bedarf nach (kann beim ersten Mal länger dauern)
-        const { data: { text } } = await Tesseract.recognize(currentImageBase64, 'ara+eng+deu', {
+        // 1. Vorverarbeitung (Kontrast + Graustufen)
+        const processed = await preprocessImage(currentImageBase64);
+
+        $('ocr-text').textContent = 'Analysiere Quittung…';
+        // 2. OCR – Arabisch + Englisch (Deutsch optional weglassen für Speed bei arabischen Bons)
+        //    Für gemischte Nutzung behalten wir ara+eng+deu
+        const { data: { text } } = await Tesseract.recognize(processed, 'ara+eng+deu', {
           logger: m => {
             if (m.status === 'recognizing text') {
               $('ocr-text').textContent = `Analysiere… ${Math.round(m.progress * 100)}%`;
             } else if (m.status === 'loading language traineddata') {
-              $('ocr-text').textContent = 'Lade Sprachmodell…';
+              $('ocr-text').textContent = 'Lade Sprachmodell (einmalig)…';
             }
           }
         });
         console.log('OCR Text:', text);
 
-        // Rohtext anzeigen (Debug)
+        // Rohtext anzeigen
         const rawBox = $('ocr-raw-box');
         const rawPre = $('ocr-raw-text');
         if (rawBox && rawPre) {
-          rawPre.textContent = text || '(kein Text erkannt)';
+          rawPre.textContent = text?.trim() || '(kein brauchbarer Text erkannt)';
           show(rawBox);
         }
 
-        const parsed = parseReceiptText(text);
+        const parsed = parseReceiptText(text || '');
 
         if (parsed.company) $('company').value = parsed.company;
         if (parsed.gross) $('amount-gross').value = parsed.gross.toFixed(2);
@@ -529,8 +575,13 @@ function setupUpload() {
         if (parsed.vat) $('amount-vat').value = parsed.vat.toFixed(2);
         if (parsed.date) $('date').value = parsed.date;
 
-        // Betrag in EUR aktualisieren
         updateEUR();
+
+        // Hinweis wenn fast nichts erkannt wurde
+        const useful = (text || '').replace(/[\s*#\-_=xX.]+/g, '').length;
+        if (useful < 15) {
+          $('ocr-text').textContent = 'Wenig Text erkannt – bitte manuell eingeben';
+        }
 
         // Karten-Vorschlag
         if (parsed.cardEndings.length > 0) {
@@ -541,7 +592,6 @@ function setupUpload() {
             $('card-suggestion').dataset.pmId = match.id;
             show($('card-suggestion'));
           } else {
-            // Keine gespeicherte Karte, aber Endung gefunden → Vorschlag zum Anlegen
             $('suggested-card').textContent = `****${parsed.cardEndings[0]} (noch nicht gespeichert)`;
             $('card-suggestion').dataset.ending = parsed.cardEndings[0];
             show($('card-suggestion'));
@@ -550,8 +600,14 @@ function setupUpload() {
       } catch (err) {
         console.error('OCR Fehler', err);
         $('ocr-text').textContent = 'OCR fehlgeschlagen – bitte manuell eingeben';
+        const rawBox = $('ocr-raw-box');
+        const rawPre = $('ocr-raw-text');
+        if (rawBox && rawPre) {
+          rawPre.textContent = 'Fehler: ' + (err.message || err);
+          show(rawBox);
+        }
       } finally {
-        setTimeout(() => hide($('ocr-status')), 1500);
+        setTimeout(() => hide($('ocr-status')), 2500);
       }
     };
     reader.readAsDataURL(file);
