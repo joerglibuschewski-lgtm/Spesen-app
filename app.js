@@ -143,6 +143,7 @@ function parseReceiptText(text) {
     net: null,
     vat: null,
     date: null,
+    currency: null,
     cardEndings: [],
     rawAmounts: [] // Debug
   };
@@ -223,39 +224,72 @@ function parseReceiptText(text) {
     }
   }
 
-  // ---------- 3. Beträge – robuste deutsche Formate ----------
-  // Erlaubt: 1.234,56 | 1234,56 | 12,34 | auch mit €/EUR drumherum
-  const amountToken = String.raw`(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})`;
+  // ---------- 3. Währung erkennen (aggressiv) ----------
+  const currencyRules = [
+    { code: 'SAR', re: /\bSAR\b|Saudi\s*Riyals?|\bS\.?\s*R\.?\b|ر\.?\s*س\.?|ريال(?:\s*سعودي)?|Riyal/i },
+    { code: 'AED', re: /\bAED\b|Dirhams?|د\.?\s*إ\.?|درهم/i },
+    { code: 'EUR', re: /\bEUR\b|€|Euros?/i },
+    { code: 'USD', re: /\bUSD\b|US\s*\$|US\s*Dollars?/i },
+    { code: 'CHF', re: /\bCHF\b|Fr\.|Franken/i },
+    { code: 'GBP', re: /\bGBP\b|£|Pounds?/i },
+    { code: 'PLN', re: /\bPLN\b|Złoty|Zloty/i },
+    { code: 'CZK', re: /\bCZK\b|Kč/i },
+    { code: 'DKK', re: /\bDKK\b/i },
+    { code: 'SEK', re: /\bSEK\b/i },
+    { code: 'NOK', re: /\bNOK\b/i }
+  ];
+  for (const rule of currencyRules) {
+    if (rule.re.test(full)) {
+      result.currency = rule.code;
+      break;
+    }
+  }
+  // Fallback: Währung direkt neben Betrag ("125.50 SAR" / "SAR 125.50")
+  if (!result.currency) {
+    const near = full.match(/(\d+[.,]\d{2})\s*(SAR|SR|AED|EUR|USD|CHF|GBP|€)/i)
+              || full.match(/(SAR|SR|AED|EUR|USD|CHF|GBP|€)\s*(\d+[.,]\d{2})/i);
+    if (near) {
+      let token = (near[2] || near[1] || '').toUpperCase();
+      if (token === '€') token = 'EUR';
+      if (token === 'SR') token = 'SAR';
+      if (['SAR', 'AED', 'EUR', 'USD', 'CHF', 'GBP'].includes(token)) {
+        result.currency = token;
+      }
+    }
+  }
 
-  // Alle vorkommenden Beträge sammeln (für Heuristik)
+  // ---------- 4. Beträge – DE + EN + internationale Formate ----------
+  // DE: 1.234,56  |  EN: 1,234.56  |  schlicht: 1234.56 / 12.34 / 12,34
+  const amountToken = String.raw`(\d{1,3}(?:[.,]\d{3})*[.,]\d{2}|\d+[.,]\d{2})`;
+
   const amountRegex = new RegExp(amountToken, 'g');
   const amounts = [];
   let am;
   while ((am = amountRegex.exec(full)) !== null) {
     const val = parseGermanAmount(am[1]);
-    if (val !== null && val > 0 && val < 100000) amounts.push(val);
+    if (val !== null && val > 0 && val < 500000) amounts.push(val);
   }
   result.rawAmounts = [...new Set(amounts)].sort((a, b) => b - a);
 
-  // Explizite Label-basierte Extraktion (höhere Priorität)
-  // Brutto / Gesamt / Summe / zu zahlen / Zahlbetrag / Endsumme / Total
+  // Labels: Total / Grand Total / Amount / Summe / SAR / TOTAL …
   const grossPatterns = [
-    new RegExp(String.raw`(?:gesamtbetrag|endsumme|summe|gesamt|total|brutto|zu\s*zahlen|zahlbetrag|betrag|payable|amount\s*due)\s*[:=]?\s*€?\s*${amountToken}\s*€?`, 'i'),
-    new RegExp(String.raw`${amountToken}\s*€?\s*(?:gesamt|summe|total|brutto)`, 'i'),
-    new RegExp(String.raw`(?:summe|gesamt|total)\s+(?:eur|€)?\s*${amountToken}`, 'i')
+    new RegExp(String.raw`(?:grand\s*total|total\s*amount|amount\s*due|amount\s*paid|net\s*amount|gesamtbetrag|endsumme|summe|gesamt|total|brutto|zu\s*zahlen|zahlbetrag|betrag|payable|إجمالي|المجموع|المبلغ)\s*[:=]?\s*(?:SAR|SR|EUR|USD|AED|CHF|€|\$)?\s*${amountToken}`, 'i'),
+    new RegExp(String.raw`(?:SAR|SR|EUR|USD|AED|€|\$)\s*${amountToken}`, 'i'),
+    new RegExp(String.raw`${amountToken}\s*(?:SAR|SR|EUR|USD|AED|€|\$|ريال)`, 'i'),
+    new RegExp(String.raw`${amountToken}\s*(?:gesamt|summe|total|brutto|amount)`, 'i')
   ];
   for (const pat of grossPatterns) {
     const m = full.match(pat);
     if (m) {
       const val = parseGermanAmount(m[1] || m[2]);
-      if (val !== null) { result.gross = val; break; }
+      if (val !== null && val > 0) { result.gross = val; break; }
     }
   }
 
   // Netto
   const netPatterns = [
-    new RegExp(String.raw`(?:nettobetrag|netto|zwischensumme|summe\s+netto|teilsumme|net)\s*[:=]?\s*€?\s*${amountToken}`, 'i'),
-    new RegExp(String.raw`${amountToken}\s*€?\s*(?:netto|net)`, 'i')
+    new RegExp(String.raw`(?:nettobetrag|netto|zwischensumme|sub\s*total|subtotal|net\s*total|قبل\s*الضريبة)\s*[:=]?\s*(?:SAR|SR|EUR|€|\$)?\s*${amountToken}`, 'i'),
+    new RegExp(String.raw`${amountToken}\s*(?:netto|net|subtotal)`, 'i')
   ];
   for (const pat of netPatterns) {
     const m = full.match(pat);
@@ -265,11 +299,11 @@ function parseReceiptText(text) {
     }
   }
 
-  // MwSt / USt (auch mit Steuersatz 7% / 19%)
+  // MwSt / VAT / Tax (inkl. saudische VAT oft 15%)
   const vatPatterns = [
-    new RegExp(String.raw`(?:mwst|ust|umsatzsteuer|mehrwertsteuer)\s*(?:\(?\s*\d{1,2}\s*%?\s*\)?)?\s*[:=]?\s*€?\s*${amountToken}`, 'i'),
-    new RegExp(String.raw`${amountToken}\s*€?\s*(?:mwst|ust|umsatzsteuer)`, 'i'),
-    new RegExp(String.raw`(?:mwst|ust)\s+\d{1,2}\s*%\s*[:=]?\s*${amountToken}`, 'i')
+    new RegExp(String.raw`(?:mwst|ust|umsatzsteuer|mehrwertsteuer|vat|tax|ضريبة|ض\.?\s*ق\.?\s*م)\s*(?:\(?\s*\d{1,2}\s*%?\s*\)?)?\s*[:=]?\s*(?:SAR|SR|EUR|€)?\s*${amountToken}`, 'i'),
+    new RegExp(String.raw`${amountToken}\s*(?:mwst|ust|vat|tax|ضريبة)`, 'i'),
+    new RegExp(String.raw`(?:vat|tax|mwst)\s+\d{1,2}\s*%\s*[:=]?\s*${amountToken}`, 'i')
   ];
   for (const pat of vatPatterns) {
     const m = full.match(pat);
@@ -279,13 +313,12 @@ function parseReceiptText(text) {
     }
   }
 
-  // Fallback-Heuristik, falls Labels nichts brauchbares geliefert haben
+  // Fallback: größter plausibler Betrag = Brutto
   if (result.gross == null && result.rawAmounts.length) {
-    // Größter Betrag ist sehr oft der Brutto-Gesamtbetrag
     result.gross = result.rawAmounts[0];
   }
 
-  // Netto + MwSt = Brutto Plausibilitätsprüfung / Ergänzung
+  // Netto + MwSt ergänzen
   if (result.gross != null) {
     if (result.net != null && result.vat == null) {
       const calcVat = Number((result.gross - result.net).toFixed(2));
@@ -294,12 +327,11 @@ function parseReceiptText(text) {
       const calcNet = Number((result.gross - result.vat).toFixed(2));
       if (calcNet > 0) result.net = calcNet;
     } else if (result.net == null && result.vat == null && result.rawAmounts.length >= 2) {
-      // Suche Paar, das zusammen den Gross ergibt (typisch Netto + MwSt)
       for (let i = 0; i < result.rawAmounts.length; i++) {
         for (let j = i + 1; j < result.rawAmounts.length; j++) {
           const a = result.rawAmounts[i];
           const b = result.rawAmounts[j];
-          if (Math.abs(a + b - result.gross) < 0.03) {
+          if (Math.abs(a + b - result.gross) < 0.05) {
             result.net = Math.min(a, b);
             result.vat = Math.max(a, b);
             break;
@@ -554,44 +586,91 @@ async function runVisionOCR(dataUrl) {
   return text;
 }
 
-/** Bild vorverarbeiten: Graustufen + höherer Kontrast + leichte Schärfung */
-function preprocessImage(dataUrl) {
+/**
+ * Beleg aufbereiten: skalieren, Inhaltsbereich zuschneiden,
+ * Graustufen + starker Kontrast → besser lesbar für Archiv & OCR
+ */
+function preprocessImage(dataUrl, opts = {}) {
+  const forArchive = opts.forArchive !== false;
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
-      const canvas = document.createElement('canvas');
-      // Maximale Kantenlänge begrenzen (schnellere OCR, oft bessere Ergebnisse)
-      const maxSide = 1600;
-      let w = img.width;
-      let h = img.height;
-      if (w > maxSide || h > maxSide) {
-        const scale = maxSide / Math.max(w, h);
-        w = Math.round(w * scale);
-        h = Math.round(h * scale);
-      }
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
+      try {
+        // 1) Auf sinnvolle Größe skalieren
+        const maxSide = forArchive ? 1800 : 1600;
+        let w = img.width;
+        let h = img.height;
+        if (w > maxSide || h > maxSide) {
+          const scale = maxSide / Math.max(w, h);
+          w = Math.round(w * scale);
+          h = Math.round(h * scale);
+        }
 
-      const imageData = ctx.getImageData(0, 0, w, h);
-      const d = imageData.data;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, w, h);
 
-      // Graustufen + Kontrast erhöhen
-      const contrast = 1.4; // >1 = mehr Kontrast
-      const intercept = 128 * (1 - contrast);
-      for (let i = 0; i < d.length; i += 4) {
-        // Graustufe
-        let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-        // Kontrast
-        gray = contrast * gray + intercept;
-        gray = Math.max(0, Math.min(255, gray));
-        d[i] = d[i + 1] = d[i + 2] = gray;
+        let imageData = ctx.getImageData(0, 0, w, h);
+        let d = imageData.data;
+
+        // 2) Graustufen + Kontrast
+        const contrast = 1.55;
+        const intercept = 128 * (1 - contrast);
+        for (let i = 0; i < d.length; i += 4) {
+          let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+          gray = contrast * gray + intercept;
+          // Leichte Aufhellung dunkler Flächen (Thermobons)
+          if (gray < 40) gray = gray * 0.5;
+          gray = Math.max(0, Math.min(255, gray));
+          d[i] = d[i + 1] = d[i + 2] = gray;
+        }
+
+        // 3) Auto-Crop: Inhaltsbereich finden (Pixel die nicht fast weiß sind)
+        const threshold = 245;
+        let minX = w, minY = h, maxX = 0, maxY = 0;
+        const step = Math.max(1, Math.floor(Math.min(w, h) / 400));
+        for (let y = 0; y < h; y += step) {
+          for (let x = 0; x < w; x += step) {
+            const idx = (y * w + x) * 4;
+            if (d[idx] < threshold) {
+              if (x < minX) minX = x;
+              if (y < minY) minY = y;
+              if (x > maxX) maxX = x;
+              if (y > maxY) maxY = y;
+            }
+          }
+        }
+
+        // Padding und Plausibilität
+        const pad = Math.round(Math.min(w, h) * 0.02);
+        minX = Math.max(0, minX - pad);
+        minY = Math.max(0, minY - pad);
+        maxX = Math.min(w - 1, maxX + pad);
+        maxY = Math.min(h - 1, maxY + pad);
+
+        const cropW = maxX - minX;
+        const cropH = maxY - minY;
+        const areaRatio = (cropW * cropH) / (w * h);
+
+        // Nur croppen wenn sinnvoll (nicht fast leer / nicht winzig)
+        if (cropW > 40 && cropH > 40 && areaRatio > 0.08 && areaRatio < 0.98) {
+          const cropped = ctx.getImageData(minX, minY, cropW, cropH);
+          canvas.width = cropW;
+          canvas.height = cropH;
+          ctx.putImageData(cropped, 0, 0);
+        } else {
+          ctx.putImageData(imageData, 0, 0);
+        }
+
+        resolve(canvas.toDataURL('image/jpeg', 0.9));
+      } catch (e) {
+        console.warn('preprocess failed', e);
+        resolve(dataUrl);
       }
-      ctx.putImageData(imageData, 0, 0);
-      resolve(canvas.toDataURL('image/jpeg', 0.92));
     };
-    img.onerror = () => resolve(dataUrl); // Fallback: Original
+    img.onerror = () => resolve(dataUrl);
     img.src = dataUrl;
   });
 }
@@ -610,7 +689,8 @@ function setupUpload() {
 
     const reader = new FileReader();
     reader.onload = async (ev) => {
-      currentImageBase64 = ev.target.result;
+      const originalDataUrl = ev.target.result;
+      currentImageBase64 = originalDataUrl;
       preview.src = currentImageBase64;
       preview.classList.remove('hidden');
       placeholder.classList.add('hidden');
@@ -619,15 +699,24 @@ function setupUpload() {
       show($('ocr-status'));
       let text = '';
       try {
+        // Beleg aufbereiten (Zuschneiden, Graustufen, Kontrast) – wird gespeichert
+        $('ocr-text').textContent = 'Beleg wird aufbereitet…';
+        const processed = await preprocessImage(originalDataUrl, { forArchive: true });
+        currentImageBase64 = processed; // Archiv-Version speichern
+        preview.src = processed;        // Vorschau aktualisieren
+
         const hasVision = !!getVisionApiKey();
 
         if (hasVision) {
           $('ocr-text').textContent = 'Google Vision analysiert…';
-          text = await runVisionOCR(currentImageBase64);
+          // Vision: Original oft besser (Farbe/Detail), Fallback auf processed
+          try {
+            text = await runVisionOCR(originalDataUrl);
+          } catch (visionErr) {
+            console.warn('Vision mit Original fehlgeschlagen, versuche aufbereitetes Bild', visionErr);
+            text = await runVisionOCR(processed);
+          }
         } else {
-          // Fallback: Tesseract + Vorverarbeitung
-          $('ocr-text').textContent = 'Bild wird vorbereitet…';
-          const processed = await preprocessImage(currentImageBase64);
           $('ocr-text').textContent = 'Analysiere mit Tesseract…';
           const result = await Tesseract.recognize(processed, 'ara+eng+deu', {
             logger: m => {
@@ -657,6 +746,17 @@ function setupUpload() {
         if (parsed.net) $('amount-net').value = parsed.net.toFixed(2);
         if (parsed.vat) $('amount-vat').value = parsed.vat.toFixed(2);
         if (parsed.date) $('date').value = parsed.date;
+        if (parsed.currency) {
+          const curSelect = $('currency');
+          // Option anlegen falls noch nicht vorhanden
+          if (curSelect && ![...curSelect.options].some(o => o.value === parsed.currency)) {
+            const opt = document.createElement('option');
+            opt.value = parsed.currency;
+            opt.textContent = parsed.currency;
+            curSelect.appendChild(opt);
+          }
+          if (curSelect) curSelect.value = parsed.currency;
+        }
 
         updateEUR();
 
