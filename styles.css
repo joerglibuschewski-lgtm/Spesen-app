@@ -179,6 +179,27 @@ html, body {
   font-size: 0.9rem;
 }
 
+.ocr-raw-box {
+  margin-bottom: 1rem;
+  font-size: 0.8rem;
+}
+.ocr-raw-box summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 0.4rem 0;
+}
+.ocr-raw-box pre {
+  background: var(--surface-2);
+  padding: 0.75rem;
+  border-radius: 8px;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.75rem;
+  direction: auto;
+}
+
 .spinner {
   width: 18px;
   height: 18px;

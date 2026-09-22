@@ -154,21 +154,46 @@ function parseReceiptText(text) {
   const full = text.replace(/[ \t]+/g, ' ').replace(/\n+/g, '\n');
 
   // ---------- 1. Firma / Händler ----------
-  // Erste sinnvolle Zeile(n) oben, oft in Großbuchstaben oder mit GmbH/KG/AG
-  const ignoreCompany = /^(summe|total|betrag|mwst|ust|netto|brutto|datum|uhrzeit|kasse|bon|beleg|tisch|bedient|kassierer|terminal|trace|auth|aid|vu[- ]?nr|tse|seriennr|steuernr|ust[- ]?id|tel\.?|fax|www\.|http|€|eur)/i;
-  for (const line of lines.slice(0, 10)) {
-    if (line.length < 3 || line.length > 60) continue;
-    if (/^\d+[.,]\d{2}/.test(line)) continue;          // beginnt mit Betrag
-    if (/^\d{1,2}[./-]\d{1,2}/.test(line)) continue;    // Datum
-    if (ignoreCompany.test(line)) continue;
-    if (/^[\d\s*#xX.]+$/.test(line)) continue;         // nur Zahlen/Sterne
-    result.company = line.replace(/\s{2,}/g, ' ').trim();
-    break;
+  // Weniger streng – akzeptiert auch arabische Schrift und gemischte Zeilen
+  const ignoreCompany = /^(summe|total|betrag|mwst|ust|netto|brutto|datum|uhrzeit|kasse|bon|beleg|tisch|bedient|kassierer|terminal|trace|auth|aid|vu[- ]?nr|tse|seriennr|steuernr|ust[- ]?id|tel\.?|fax|www\.|http|€|eur|sar|riyals?|amount|vat|tax|invoice|receipt|date|time|cashier)/i;
+
+  // Kandidaten sammeln (erste 12 Zeilen)
+  const candidates = [];
+  for (const line of lines.slice(0, 12)) {
+    const clean = line.replace(/\s{2,}/g, ' ').trim();
+    if (clean.length < 2 || clean.length > 80) continue;
+    if (/^[\d\s*#xX.•\-_=]+$/.test(clean)) continue;   // nur Symbole/Zahlen
+    if (/^\d+[.,]\d{2}/.test(clean)) continue;          // beginnt mit Betrag
+    if (/^\d{1,2}[./\-]\d{1,2}/.test(clean)) continue;  // Datum
+    if (ignoreCompany.test(clean)) continue;
+    // Mindestens ein Buchstabe (lateinisch oder arabisch)
+    if (!/[a-zA-ZÄÖÜäöüß\u0600-\u06FF]/.test(clean)) continue;
+    candidates.push(clean);
   }
-  // Fallback: Zeile mit typischen Firmenzusätzen
-  if (!result.company) {
-    const firmMatch = full.match(/\b([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9 &.\-]{2,40}(?:GmbH|KG|AG|e\.?\s*K\.?|OHG|UG|GbR|Markt|Center|Shop|Tankstelle|Restaurant|Hotel)?)/);
-    if (firmMatch) result.company = firmMatch[1].trim();
+
+  // Beste Zeile nehmen: möglichst lange, nicht nur Zahlen
+  if (candidates.length > 0) {
+    // Bevorzuge Zeilen mit arabischen oder lateinischen Buchstaben und mittlerer Länge
+    candidates.sort((a, b) => {
+      const score = (s) => {
+        let sc = s.length;
+        if (/[\u0600-\u06FF]/.test(s)) sc += 20; // Arabisch bevorzugen bei saudischen Bons
+        if (/[A-Za-z]{3,}/.test(s)) sc += 10;
+        return sc;
+      };
+      return score(b) - score(a);
+    });
+    result.company = candidates[0];
+  }
+
+  // Fallback: erste Zeile, die überhaupt Text enthält
+  if (!result.company && lines.length > 0) {
+    for (const line of lines.slice(0, 6)) {
+      if (/[a-zA-ZÄÖÜäöüß\u0600-\u06FF]{2,}/.test(line)) {
+        result.company = line.replace(/\s{2,}/g, ' ').trim().slice(0, 60);
+        break;
+      }
+    }
   }
 
   // ---------- 2. Datum (DD.MM.YYYY / DD.MM.YY / DD-MM-YYYY) ----------
@@ -487,6 +512,15 @@ function setupUpload() {
           }
         });
         console.log('OCR Text:', text);
+
+        // Rohtext anzeigen (Debug)
+        const rawBox = $('ocr-raw-box');
+        const rawPre = $('ocr-raw-text');
+        if (rawBox && rawPre) {
+          rawPre.textContent = text || '(kein Text erkannt)';
+          show(rawBox);
+        }
+
         const parsed = parseReceiptText(text);
 
         if (parsed.company) $('company').value = parsed.company;
