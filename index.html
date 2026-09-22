@@ -236,23 +236,34 @@
           <h3 style="margin-top:1.5rem">Projekte</h3>
           <p class="hint">Projekte werden automatisch aus deinen Eingaben gelernt.</p>
 
+          <h3 style="margin-top:1.5rem">OCR – Google Cloud Vision</h3>
+          <p class="hint">
+            Deutlich bessere Texterkennung (auch Arabisch / saudische Bons).
+            Kostenloses Kontingent: ca. 1000 Bilder/Monat.
+          </p>
+          <div class="form-group">
+            <label for="vision-api-key">Vision API-Key</label>
+            <input type="password" id="vision-api-key" placeholder="AIza…" autocomplete="off" />
+          </div>
+          <p id="vision-status" class="hint">Status: Tesseract (lokal)</p>
+          <button id="btn-save-vision-key" class="btn btn-primary btn-block">API-Key speichern</button>
+
           <h3 style="margin-top:1.5rem">Google Drive (für Steuerberater)</h3>
           <p class="hint">
             Die App legt einen Ordner <strong>SpesenTracker</strong> an und darin
             monatliche Unterordner (z. B. 2026-09) mit Bildern, PDF und CSV.
           </p>
           <div class="form-group">
-            <label for="google-client-id">Google Cloud Client-ID</label>
+            <label for="google-client-id">Google Cloud Client-ID (OAuth)</label>
             <input type="text" id="google-client-id" placeholder="xxxxxxxx.apps.googleusercontent.com" />
           </div>
           <p id="drive-status" class="hint">Status: Nicht verbunden</p>
           <button id="btn-google-connect" class="btn btn-primary btn-block">Mit Google verbinden</button>
           <button id="btn-google-disconnect" class="btn btn-secondary btn-block hidden">Verbindung trennen</button>
           <p class="hint" style="margin-top:0.75rem">
-            Anleitung: Google Cloud Console → Neues Projekt → APIs & Dienste → 
-            Google Drive API aktivieren → OAuth-Zustimmungsbildschirm → 
-            Anmeldedaten → OAuth-Client-ID (Webanwendung) erstellen. 
-            Autorisierte JavaScript-Ursprünge: deine App-URL (z. B. http://localhost:5500).
+            Anleitung Vision: Google Cloud Console → Projekt → Vision API aktivieren →
+            Anmeldedaten → API-Schlüssel erstellen → ggf. auf deine Domain einschränken.<br><br>
+            Anleitung Drive: OAuth-Client-ID (Webanwendung) + autorisierte JavaScript-Ursprünge.
           </p>
         </div>
       </div>

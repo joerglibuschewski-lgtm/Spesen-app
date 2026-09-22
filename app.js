@@ -477,6 +477,83 @@ function setupTabs() {
   });
 }
 
+// ========== Google Cloud Vision OCR ==========
+function getVisionApiKey() {
+  return localStorage.getItem('spesen_vision_api_key') || '';
+}
+
+function setVisionApiKey(key) {
+  if (key) localStorage.setItem('spesen_vision_api_key', key.trim());
+  else localStorage.removeItem('spesen_vision_api_key');
+  updateVisionStatusUI();
+}
+
+function updateVisionStatusUI() {
+  const el = $('vision-status');
+  if (!el) return;
+  if (getVisionApiKey()) {
+    el.textContent = 'Status: Google Cloud Vision aktiv ✓';
+    el.style.color = 'var(--success, #22c55e)';
+  } else {
+    el.textContent = 'Status: Tesseract (lokal)';
+    el.style.color = '';
+  }
+}
+
+/** Google Cloud Vision – DOCUMENT_TEXT_DETECTION (besser für Belege) */
+async function runVisionOCR(dataUrl) {
+  const apiKey = getVisionApiKey();
+  if (!apiKey) throw new Error('Kein Vision API-Key hinterlegt');
+
+  // data:image/jpeg;base64,xxxx → nur den Base64-Teil
+  const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+
+  const body = {
+    requests: [{
+      image: { content: base64 },
+      features: [
+        { type: 'DOCUMENT_TEXT_DETECTION' }  // besser für strukturierte Belege als TEXT_DETECTION
+      ],
+      imageContext: {
+        languageHints: ['ar', 'en', 'de']   // Arabisch, Englisch, Deutsch
+      }
+    }]
+  };
+
+  const res = await fetch(
+    `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }
+  );
+
+  if (!res.ok) {
+    const errText = await res.text();
+    let msg = `Vision API Fehler (${res.status})`;
+    try {
+      const j = JSON.parse(errText);
+      if (j.error?.message) msg = j.error.message;
+    } catch (_) {}
+    throw new Error(msg);
+  }
+
+  const data = await res.json();
+  const annotation = data.responses?.[0];
+
+  if (annotation?.error) {
+    throw new Error(annotation.error.message || 'Vision-Fehler');
+  }
+
+  // fullTextAnnotation hat den kompletten Text (inkl. Arabisch)
+  const text = annotation?.fullTextAnnotation?.text
+            || annotation?.textAnnotations?.[0]?.description
+            || '';
+
+  return text;
+}
+
 /** Bild vorverarbeiten: Graustufen + höherer Kontrast + leichte Schärfung */
 function preprocessImage(dataUrl) {
   return new Promise((resolve) => {
@@ -540,23 +617,29 @@ function setupUpload() {
 
       // OCR starten
       show($('ocr-status'));
-      $('ocr-text').textContent = 'Bild wird vorbereitet…';
+      let text = '';
       try {
-        // 1. Vorverarbeitung (Kontrast + Graustufen)
-        const processed = await preprocessImage(currentImageBase64);
+        const hasVision = !!getVisionApiKey();
 
-        $('ocr-text').textContent = 'Analysiere Quittung…';
-        // 2. OCR – Arabisch + Englisch (Deutsch optional weglassen für Speed bei arabischen Bons)
-        //    Für gemischte Nutzung behalten wir ara+eng+deu
-        const { data: { text } } = await Tesseract.recognize(processed, 'ara+eng+deu', {
-          logger: m => {
-            if (m.status === 'recognizing text') {
-              $('ocr-text').textContent = `Analysiere… ${Math.round(m.progress * 100)}%`;
-            } else if (m.status === 'loading language traineddata') {
-              $('ocr-text').textContent = 'Lade Sprachmodell (einmalig)…';
+        if (hasVision) {
+          $('ocr-text').textContent = 'Google Vision analysiert…';
+          text = await runVisionOCR(currentImageBase64);
+        } else {
+          // Fallback: Tesseract + Vorverarbeitung
+          $('ocr-text').textContent = 'Bild wird vorbereitet…';
+          const processed = await preprocessImage(currentImageBase64);
+          $('ocr-text').textContent = 'Analysiere mit Tesseract…';
+          const result = await Tesseract.recognize(processed, 'ara+eng+deu', {
+            logger: m => {
+              if (m.status === 'recognizing text') {
+                $('ocr-text').textContent = `Tesseract… ${Math.round(m.progress * 100)}%`;
+              } else if (m.status === 'loading language traineddata') {
+                $('ocr-text').textContent = 'Lade Sprachmodell…';
+              }
             }
-          }
-        });
+          });
+          text = result?.data?.text || '';
+        }
         console.log('OCR Text:', text);
 
         // Rohtext anzeigen
@@ -716,8 +799,24 @@ function setupPaymentModals() {
 }
 
 function setupSettings() {
-  $('btn-settings')?.addEventListener('click', () => show($('settings-modal')));
+  $('btn-settings')?.addEventListener('click', () => {
+    // Keys in Felder laden
+    const visionKey = getVisionApiKey();
+    if ($('vision-api-key') && visionKey) $('vision-api-key').value = visionKey;
+    updateVisionStatusUI();
+    show($('settings-modal'));
+  });
   $('btn-close-settings')?.addEventListener('click', () => hide($('settings-modal')));
+
+  $('btn-save-vision-key')?.addEventListener('click', () => {
+    const key = ($('vision-api-key')?.value || '').trim();
+    setVisionApiKey(key);
+    if (key) {
+      alert('Vision API-Key gespeichert. Nächster Scan nutzt Google Cloud Vision.');
+    } else {
+      alert('Key gelöscht. Es wird wieder Tesseract verwendet.');
+    }
+  });
 }
 
 /** Erzeugt einen sicheren Dateinamen für den Bon */
@@ -1323,6 +1422,7 @@ async function init() {
   setupSettings();
   setupExport();
   setupGoogleDrive();
+  updateVisionStatusUI();
 
   $('currency').addEventListener('change', updateEUR);
   $('amount-gross').addEventListener('input', updateEUR);
