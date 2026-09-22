@@ -1,0 +1,1232 @@
+/**
+ * SpesenTracker PWA - Core Logic
+ * Basiswährung: EUR
+ * Features: OCR, Währungsumrechnung, Zahlungsmittel mit Karten-Endung, lokale Speicherung
+ */
+
+const DB_NAME = 'SpesenTrackerDB';
+const DB_VERSION = 1;
+const STORE_EXPENSES = 'expenses';
+const STORE_PAYMENTS = 'paymentMethods';
+const STORE_PROJECTS = 'projects';
+
+let db = null;
+let currentImageBase64 = null;
+let currentRates = { EUR: 1 }; // Cache
+
+// ========== IndexedDB ==========
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      db = request.result;
+      resolve(db);
+    };
+    request.onupgradeneeded = (e) => {
+      const database = e.target.result;
+      if (!database.objectStoreNames.contains(STORE_EXPENSES)) {
+        const store = database.createObjectStore(STORE_EXPENSES, { keyPath: 'id', autoIncrement: true });
+        store.createIndex('date', 'date', { unique: false });
+        store.createIndex('project', 'project', { unique: false });
+      }
+      if (!database.objectStoreNames.contains(STORE_PAYMENTS)) {
+        database.createObjectStore(STORE_PAYMENTS, { keyPath: 'id', autoIncrement: true });
+      }
+      if (!database.objectStoreNames.contains(STORE_PROJECTS)) {
+        database.createObjectStore(STORE_PROJECTS, { keyPath: 'name' });
+      }
+    };
+  });
+}
+
+function dbAdd(storeName, data) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    const req = store.add(data);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbGetAll(storeName) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbPut(storeName, data) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    const req = store.put(data);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbDelete(storeName, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    const req = store.delete(key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// ========== Währungskurse ==========
+async function fetchRates() {
+  try {
+    const res = await fetch('https://api.frankfurter.app/latest?from=EUR');
+    if (!res.ok) throw new Error('Rate fetch failed');
+    const data = await res.json();
+    // frankfurter liefert Kurse als EUR -> andere. Wir brauchen inverse für Umrechnung in EUR.
+    currentRates = { EUR: 1 };
+    for (const [cur, rate] of Object.entries(data.rates)) {
+      currentRates[cur] = rate; // 1 EUR = rate CUR
+    }
+    console.log('Kurse geladen', currentRates);
+  } catch (err) {
+    console.warn('Kurse konnten nicht geladen werden, verwende Cache/Fallback', err);
+    // Fallback grobe Kurse
+    currentRates = {
+      EUR: 1, CHF: 0.94, USD: 1.08, GBP: 0.85,
+      PLN: 4.3, CZK: 25.2, HUF: 395, SEK: 11.4, NOK: 11.6, DKK: 7.46
+    };
+  }
+}
+
+function convertToEUR(amount, currency) {
+  if (!amount || isNaN(amount)) return 0;
+  if (currency === 'EUR') return Number(amount);
+  const rate = currentRates[currency];
+  if (!rate) return Number(amount); // Fallback
+  // rate = wie viele CUR für 1 EUR → amount CUR / rate = EUR
+  return Number((amount / rate).toFixed(2));
+}
+
+// ========== OCR Parsing (deutsche Quittungen / Kassenbons) ==========
+// Verbesserte Regeln für typische DE-Bons (REWE, Edeka, Tankstellen, Restaurants, Amazon etc.)
+
+function parseGermanAmount(str) {
+  if (!str) return null;
+  // 1.234,56 oder 1234,56 oder 12,34 → Number
+  const cleaned = String(str).replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? null : num;
+}
+
+function parseReceiptText(text) {
+  const result = {
+    company: null,
+    gross: null,
+    net: null,
+    vat: null,
+    date: null,
+    cardEndings: [],
+    rawAmounts: [] // Debug
+  };
+
+  if (!text) return result;
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  // Normalisierter Volltext (Leerzeichen vereinheitlicht, aber Zeilenstruktur behalten für Kontext)
+  const full = text.replace(/[ \t]+/g, ' ').replace(/\n+/g, '\n');
+
+  // ---------- 1. Firma / Händler ----------
+  // Erste sinnvolle Zeile(n) oben, oft in Großbuchstaben oder mit GmbH/KG/AG
+  const ignoreCompany = /^(summe|total|betrag|mwst|ust|netto|brutto|datum|uhrzeit|kasse|bon|beleg|tisch|bedient|kassierer|terminal|trace|auth|aid|vu[- ]?nr|tse|seriennr|steuernr|ust[- ]?id|tel\.?|fax|www\.|http|€|eur)/i;
+  for (const line of lines.slice(0, 10)) {
+    if (line.length < 3 || line.length > 60) continue;
+    if (/^\d+[.,]\d{2}/.test(line)) continue;          // beginnt mit Betrag
+    if (/^\d{1,2}[./-]\d{1,2}/.test(line)) continue;    // Datum
+    if (ignoreCompany.test(line)) continue;
+    if (/^[\d\s*#xX.]+$/.test(line)) continue;         // nur Zahlen/Sterne
+    result.company = line.replace(/\s{2,}/g, ' ').trim();
+    break;
+  }
+  // Fallback: Zeile mit typischen Firmenzusätzen
+  if (!result.company) {
+    const firmMatch = full.match(/\b([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9 &.\-]{2,40}(?:GmbH|KG|AG|e\.?\s*K\.?|OHG|UG|GbR|Markt|Center|Shop|Tankstelle|Restaurant|Hotel)?)/);
+    if (firmMatch) result.company = firmMatch[1].trim();
+  }
+
+  // ---------- 2. Datum (DD.MM.YYYY / DD.MM.YY / DD-MM-YYYY) ----------
+  const datePatterns = [
+    /(\d{1,2})[./-](\d{1,2})[./-](\d{4})/,           // 22.09.2026
+    /(\d{1,2})[./-](\d{1,2})[./-](\d{2})(?!\d)/,     // 22.09.26
+    /(\d{4})[./-](\d{1,2})[./-](\d{1,2})/            // 2026-09-22 (selten)
+  ];
+  for (const pat of datePatterns) {
+    const m = full.match(pat);
+    if (m) {
+      let d, mth, y;
+      if (m[1].length === 4) { // YYYY-MM-DD
+        y = m[1]; mth = m[2]; d = m[3];
+      } else {
+        d = m[1]; mth = m[2]; y = m[3];
+        if (y.length === 2) y = (parseInt(y, 10) > 50 ? '19' : '20') + y;
+      }
+      const day = d.padStart(2, '0');
+      const month = mth.padStart(2, '0');
+      // Plausibilität
+      if (parseInt(month, 10) >= 1 && parseInt(month, 10) <= 12 &&
+          parseInt(day, 10) >= 1 && parseInt(day, 10) <= 31) {
+        result.date = `${y}-${month}-${day}`;
+        break;
+      }
+    }
+  }
+
+  // ---------- 3. Beträge – robuste deutsche Formate ----------
+  // Erlaubt: 1.234,56 | 1234,56 | 12,34 | auch mit €/EUR drumherum
+  const amountToken = String.raw`(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})`;
+
+  // Alle vorkommenden Beträge sammeln (für Heuristik)
+  const amountRegex = new RegExp(amountToken, 'g');
+  const amounts = [];
+  let am;
+  while ((am = amountRegex.exec(full)) !== null) {
+    const val = parseGermanAmount(am[1]);
+    if (val !== null && val > 0 && val < 100000) amounts.push(val);
+  }
+  result.rawAmounts = [...new Set(amounts)].sort((a, b) => b - a);
+
+  // Explizite Label-basierte Extraktion (höhere Priorität)
+  // Brutto / Gesamt / Summe / zu zahlen / Zahlbetrag / Endsumme / Total
+  const grossPatterns = [
+    new RegExp(String.raw`(?:gesamtbetrag|endsumme|summe|gesamt|total|brutto|zu\s*zahlen|zahlbetrag|betrag|payable|amount\s*due)\s*[:=]?\s*€?\s*${amountToken}\s*€?`, 'i'),
+    new RegExp(String.raw`${amountToken}\s*€?\s*(?:gesamt|summe|total|brutto)`, 'i'),
+    new RegExp(String.raw`(?:summe|gesamt|total)\s+(?:eur|€)?\s*${amountToken}`, 'i')
+  ];
+  for (const pat of grossPatterns) {
+    const m = full.match(pat);
+    if (m) {
+      const val = parseGermanAmount(m[1] || m[2]);
+      if (val !== null) { result.gross = val; break; }
+    }
+  }
+
+  // Netto
+  const netPatterns = [
+    new RegExp(String.raw`(?:nettobetrag|netto|zwischensumme|summe\s+netto|teilsumme|net)\s*[:=]?\s*€?\s*${amountToken}`, 'i'),
+    new RegExp(String.raw`${amountToken}\s*€?\s*(?:netto|net)`, 'i')
+  ];
+  for (const pat of netPatterns) {
+    const m = full.match(pat);
+    if (m) {
+      const val = parseGermanAmount(m[1] || m[2]);
+      if (val !== null) { result.net = val; break; }
+    }
+  }
+
+  // MwSt / USt (auch mit Steuersatz 7% / 19%)
+  const vatPatterns = [
+    new RegExp(String.raw`(?:mwst|ust|umsatzsteuer|mehrwertsteuer)\s*(?:\(?\s*\d{1,2}\s*%?\s*\)?)?\s*[:=]?\s*€?\s*${amountToken}`, 'i'),
+    new RegExp(String.raw`${amountToken}\s*€?\s*(?:mwst|ust|umsatzsteuer)`, 'i'),
+    new RegExp(String.raw`(?:mwst|ust)\s+\d{1,2}\s*%\s*[:=]?\s*${amountToken}`, 'i')
+  ];
+  for (const pat of vatPatterns) {
+    const m = full.match(pat);
+    if (m) {
+      const val = parseGermanAmount(m[1] || m[2]);
+      if (val !== null) { result.vat = val; break; }
+    }
+  }
+
+  // Fallback-Heuristik, falls Labels nichts brauchbares geliefert haben
+  if (result.gross == null && result.rawAmounts.length) {
+    // Größter Betrag ist sehr oft der Brutto-Gesamtbetrag
+    result.gross = result.rawAmounts[0];
+  }
+
+  // Netto + MwSt = Brutto Plausibilitätsprüfung / Ergänzung
+  if (result.gross != null) {
+    if (result.net != null && result.vat == null) {
+      const calcVat = Number((result.gross - result.net).toFixed(2));
+      if (calcVat > 0) result.vat = calcVat;
+    } else if (result.vat != null && result.net == null) {
+      const calcNet = Number((result.gross - result.vat).toFixed(2));
+      if (calcNet > 0) result.net = calcNet;
+    } else if (result.net == null && result.vat == null && result.rawAmounts.length >= 2) {
+      // Suche Paar, das zusammen den Gross ergibt (typisch Netto + MwSt)
+      for (let i = 0; i < result.rawAmounts.length; i++) {
+        for (let j = i + 1; j < result.rawAmounts.length; j++) {
+          const a = result.rawAmounts[i];
+          const b = result.rawAmounts[j];
+          if (Math.abs(a + b - result.gross) < 0.03) {
+            result.net = Math.min(a, b);
+            result.vat = Math.max(a, b);
+            break;
+          }
+        }
+        if (result.net != null) break;
+      }
+    }
+  }
+
+  // ---------- 4. Karten-Endungen (****1234, endet auf, PAN, girocard …) ----------
+  const endings = new Set();
+
+  // Klassische Maskierungen: ****1234  XXXX1234  ####1234  ** ** 1234
+  const maskPatterns = [
+    /(?:\*{2,4}|x{2,4}|#{2,4}|•{2,4})\s*(\d{4})\b/gi,
+    /(?:\*{2,4}|x{2,4}|#{2,4})\s*(\d{4})/gi,
+    /endet\s*(?:auf|mit)?\s*(\d{4})\b/gi,
+    /end[e]?t?\s*(?:auf|mit)?\s*(\d{4})\b/gi
+  ];
+  maskPatterns.forEach(pat => {
+    let m;
+    while ((m = pat.exec(full)) !== null) {
+      if (m[1] && m[1].length === 4) endings.add(m[1]);
+    }
+  });
+
+  // In der Nähe von Karten-Keywords
+  const cardContext = /(?:karte|card|visa|mastercard|master\s*card|amex|american\s*express|girocard|ec[- ]?karte|giro[- ]?card|debit|kreditkarte|pan|zahlungsart)[^\n\d]{0,50}(\d{4})\b/gi;
+  let cm;
+  while ((cm = cardContext.exec(full)) !== null) {
+    if (cm[1]) endings.add(cm[1]);
+  }
+
+  // Manche Bons schreiben nur die letzten 4 Ziffern nach "Karte" oder in einer eigenen Zeile
+  const shortCardLine = /(?:^|\n)\s*(?:karte|visa|master|giro|ec)[^\d\n]{0,20}(\d{4})\s*(?:\n|$)/gi;
+  while ((cm = shortCardLine.exec(text)) !== null) {
+    if (cm[1]) endings.add(cm[1]);
+  }
+
+  result.cardEndings = [...endings];
+
+  return result;
+}
+
+// ========== UI Helpers ==========
+function $(id) { return document.getElementById(id); }
+function show(el) { el.classList.remove('hidden'); }
+function hide(el) { el.classList.add('hidden'); }
+
+function setToday() {
+  const today = new Date().toISOString().slice(0, 10);
+  $('date').value = today;
+}
+
+async function loadPaymentMethods() {
+  const methods = await dbGetAll(STORE_PAYMENTS);
+  const select = $('payment-method');
+  select.innerHTML = '<option value="">– bitte wählen –</option>';
+  methods.forEach(pm => {
+    const opt = document.createElement('option');
+    opt.value = pm.id;
+    opt.textContent = pm.ending ? `${pm.name} (****${pm.ending})` : pm.name;
+    select.appendChild(opt);
+  });
+  // Settings list
+  const list = $('payment-methods-list');
+  if (list) {
+    list.innerHTML = '';
+    methods.forEach(pm => {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <span>${pm.name}${pm.ending ? ' ****' + pm.ending : ''}</span>
+        <button data-id="${pm.id}" class="btn-delete-pm">🗑</button>
+      `;
+      list.appendChild(li);
+    });
+    list.querySelectorAll('.btn-delete-pm').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (confirm('Zahlungsmittel löschen?')) {
+          await dbDelete(STORE_PAYMENTS, Number(btn.dataset.id));
+          await loadPaymentMethods();
+        }
+      });
+    });
+  }
+}
+
+async function loadProjects() {
+  const projects = await dbGetAll(STORE_PROJECTS);
+  const datalist = $('project-list');
+  if (datalist) {
+    datalist.innerHTML = '';
+    projects.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      datalist.appendChild(opt);
+    });
+  }
+}
+
+async function renderExpenseList(filter = '') {
+  const expenses = await dbGetAll(STORE_EXPENSES);
+  const list = $('expense-list');
+  const empty = $('empty-list');
+  list.innerHTML = '';
+
+  const filtered = expenses
+    .filter(e => {
+      if (!filter) return true;
+      const q = filter.toLowerCase();
+      return (e.company || '').toLowerCase().includes(q) ||
+             (e.project || '').toLowerCase().includes(q) ||
+             (e.note || '').toLowerCase().includes(q);
+    })
+    .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+  if (filtered.length === 0) {
+    show(empty);
+    return;
+  }
+  hide(empty);
+
+  filtered.forEach(exp => {
+    const card = document.createElement('div');
+    card.className = 'expense-item';
+    card.innerHTML = `
+      <div class="expense-main">
+        <div class="expense-title">${exp.company || 'Unbekannt'}</div>
+        <div class="expense-meta">${exp.date || '–'} · ${exp.project || 'kein Projekt'} · ${exp.paymentName || '–'}</div>
+        <div class="expense-amounts">
+          <span class="gross">${Number(exp.amountEUR).toFixed(2)} €</span>
+          ${exp.currency !== 'EUR' ? `<span class="orig">(${Number(exp.gross).toFixed(2)} ${exp.currency})</span>` : ''}
+        </div>
+      </div>
+      <div class="expense-actions">
+        ${exp.image ? `<button class="icon-btn view-img" data-id="${exp.id}">🖼</button>` : ''}
+        <button class="icon-btn delete-exp" data-id="${exp.id}">🗑</button>
+      </div>
+    `;
+    list.appendChild(card);
+  });
+
+  list.querySelectorAll('.delete-exp').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (confirm('Spese wirklich löschen?')) {
+        await dbDelete(STORE_EXPENSES, Number(btn.dataset.id));
+        renderExpenseList($('search-list').value);
+      }
+    });
+  });
+
+  list.querySelectorAll('.view-img').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const expenses = await dbGetAll(STORE_EXPENSES);
+      const exp = expenses.find(e => e.id === Number(btn.dataset.id));
+      if (exp && exp.image) {
+        const w = window.open('');
+        w.document.write(`<img src="${exp.image}" style="max-width:100%">`);
+      }
+    });
+  });
+}
+
+// ========== Event Handlers ==========
+function setupTabs() {
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      tab.classList.add('active');
+      $(`tab-${tab.dataset.tab}`).classList.add('active');
+      if (tab.dataset.tab === 'list') renderExpenseList();
+    });
+  });
+}
+
+function setupUpload() {
+  const input = $('receipt-input');
+  const area = $('upload-area');
+  const placeholder = $('upload-placeholder');
+  const preview = $('receipt-preview');
+
+  area.addEventListener('click', () => input.click());
+
+  input.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      currentImageBase64 = ev.target.result;
+      preview.src = currentImageBase64;
+      preview.classList.remove('hidden');
+      placeholder.classList.add('hidden');
+
+      // OCR starten
+      show($('ocr-status'));
+      $('ocr-text').textContent = 'Analysiere Quittung…';
+      try {
+        const { data: { text } } = await Tesseract.recognize(currentImageBase64, 'deu+eng', {
+          logger: m => {
+            if (m.status === 'recognizing text') {
+              $('ocr-text').textContent = `Analysiere… ${Math.round(m.progress * 100)}%`;
+            }
+          }
+        });
+        console.log('OCR Text:', text);
+        const parsed = parseReceiptText(text);
+
+        if (parsed.company) $('company').value = parsed.company;
+        if (parsed.gross) $('amount-gross').value = parsed.gross.toFixed(2);
+        if (parsed.net) $('amount-net').value = parsed.net.toFixed(2);
+        if (parsed.vat) $('amount-vat').value = parsed.vat.toFixed(2);
+        if (parsed.date) $('date').value = parsed.date;
+
+        // Betrag in EUR aktualisieren
+        updateEUR();
+
+        // Karten-Vorschlag
+        if (parsed.cardEndings.length > 0) {
+          const methods = await dbGetAll(STORE_PAYMENTS);
+          const match = methods.find(pm => parsed.cardEndings.includes(pm.ending));
+          if (match) {
+            $('suggested-card').textContent = `${match.name} (****${match.ending})`;
+            $('card-suggestion').dataset.pmId = match.id;
+            show($('card-suggestion'));
+          } else {
+            // Keine gespeicherte Karte, aber Endung gefunden → Vorschlag zum Anlegen
+            $('suggested-card').textContent = `****${parsed.cardEndings[0]} (noch nicht gespeichert)`;
+            $('card-suggestion').dataset.ending = parsed.cardEndings[0];
+            show($('card-suggestion'));
+          }
+        }
+      } catch (err) {
+        console.error('OCR Fehler', err);
+        $('ocr-text').textContent = 'OCR fehlgeschlagen – bitte manuell eingeben';
+      } finally {
+        setTimeout(() => hide($('ocr-status')), 1500);
+      }
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function updateEUR() {
+  const gross = parseFloat($('amount-gross').value) || 0;
+  const currency = $('currency').value;
+  const eur = convertToEUR(gross, currency);
+  $('amount-eur').value = eur.toFixed(2);
+}
+
+async function handleSave(e) {
+  e.preventDefault();
+
+  const paymentSelect = $('payment-method');
+  let paymentId = paymentSelect.value;
+  let paymentName = paymentSelect.options[paymentSelect.selectedIndex]?.text || '';
+
+  // Falls Custom (über Modal neu angelegt, sollte schon in DB sein)
+
+  const projectName = $('project').value.trim();
+  if (projectName) {
+    await dbPut(STORE_PROJECTS, { name: projectName });
+  }
+
+  const expense = {
+    company: $('company').value.trim(),
+    date: $('date').value,
+    gross: parseFloat($('amount-gross').value) || 0,
+    net: parseFloat($('amount-net').value) || null,
+    vat: parseFloat($('amount-vat').value) || null,
+    currency: $('currency').value,
+    amountEUR: parseFloat($('amount-eur').value) || 0,
+    project: projectName || null,
+    paymentId: paymentId ? Number(paymentId) : null,
+    paymentName: paymentName,
+    category: $('category').value,
+    note: $('note').value.trim(),
+    image: currentImageBase64,
+    createdAt: new Date().toISOString()
+  };
+
+  await dbAdd(STORE_EXPENSES, expense);
+
+  // Reset Form
+  $('expense-form').reset();
+  setToday();
+  currentImageBase64 = null;
+  $('receipt-preview').classList.add('hidden');
+  $('upload-placeholder').classList.remove('hidden');
+  hide($('card-suggestion'));
+  updateEUR();
+
+  alert('Spese gespeichert!');
+  // Zur Liste wechseln
+  document.querySelector('.tab[data-tab="list"]').click();
+}
+
+function setupPaymentModals() {
+  $('btn-add-payment')?.addEventListener('click', () => {
+    $('pm-name').value = '';
+    $('pm-ending').value = '';
+    $('pm-type').value = 'card';
+    show($('payment-modal'));
+  });
+  $('btn-new-payment')?.addEventListener('click', () => {
+    $('pm-name').value = '';
+    $('pm-ending').value = '';
+    $('pm-type').value = 'card';
+    show($('payment-modal'));
+  });
+  $('btn-close-payment')?.addEventListener('click', () => hide($('payment-modal')));
+  $('btn-save-payment')?.addEventListener('click', async () => {
+    const name = $('pm-name').value.trim();
+    if (!name) return alert('Name erforderlich');
+    const ending = $('pm-ending').value.trim().replace(/\D/g, '').slice(-4) || null;
+    await dbAdd(STORE_PAYMENTS, {
+      name,
+      ending,
+      type: $('pm-type').value
+    });
+    await loadPaymentMethods();
+    hide($('payment-modal'));
+  });
+
+  // Card suggestion accept/reject
+  $('btn-accept-card')?.addEventListener('click', async () => {
+    const suggestion = $('card-suggestion');
+    if (suggestion.dataset.pmId) {
+      $('payment-method').value = suggestion.dataset.pmId;
+    } else if (suggestion.dataset.ending) {
+      // Neues anlegen
+      const ending = suggestion.dataset.ending;
+      const name = prompt('Name für diese Karte:', `Karte ****${ending}`);
+      if (name) {
+        const id = await dbAdd(STORE_PAYMENTS, { name, ending, type: 'card' });
+        await loadPaymentMethods();
+        $('payment-method').value = id;
+      }
+    }
+    hide(suggestion);
+  });
+  $('btn-reject-card')?.addEventListener('click', () => hide($('card-suggestion')));
+}
+
+function setupSettings() {
+  $('btn-settings')?.addEventListener('click', () => show($('settings-modal')));
+  $('btn-close-settings')?.addEventListener('click', () => hide($('settings-modal')));
+}
+
+/** Erzeugt einen sicheren Dateinamen für den Bon */
+function makeArchiveFilename(exp, index) {
+  const date = exp.date || 'ohne-datum';
+  const company = (exp.company || 'Unbekannt')
+    .replace(/[^\wÄÖÜäöüß\- ]/g, '')
+    .replace(/\s+/g, '_')
+    .slice(0, 30);
+  const amount = Number(exp.amountEUR || exp.gross || 0).toFixed(2).replace('.', ',');
+  const prefix = String(index + 1).padStart(3, '0');
+  return `${prefix}_${date}_${company}_${amount}EUR`;
+}
+
+/** Filtert Spesen nach dem gewählten Zeitraum */
+async function getFilteredExpenses() {
+  const expenses = await dbGetAll(STORE_EXPENSES);
+  const from = $('export-from').value;
+  const to = $('export-to').value;
+  let filtered = expenses;
+  if (from) filtered = filtered.filter(e => e.date >= from);
+  if (to) filtered = filtered.filter(e => e.date <= to);
+  filtered.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  return filtered;
+}
+
+function setupExport() {
+  // ---- PDF ----
+  $('btn-generate-pdf')?.addEventListener('click', async () => {
+    const filtered = await getFilteredExpenses();
+    if (filtered.length === 0) {
+      alert('Keine Spesen im gewählten Zeitraum.');
+      return;
+    }
+
+    const from = $('export-from').value;
+    const to = $('export-to').value;
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+    let y = 20;
+
+    doc.setFontSize(16);
+    doc.text('Spesenabrechnung', 14, y);
+    y += 8;
+    doc.setFontSize(10);
+    doc.text(`Zeitraum: ${from || 'Anfang'} – ${to || 'Ende'}`, 14, y);
+    y += 6;
+    doc.text(`Erstellt am: ${new Date().toLocaleDateString('de-DE')}`, 14, y);
+    y += 12;
+
+    let totalEUR = 0;
+
+    filtered.forEach((exp, idx) => {
+      if (y > 270) {
+        doc.addPage();
+        y = 20;
+      }
+      doc.setFontSize(11);
+      doc.setFont(undefined, 'bold');
+      doc.text(`${idx + 1}. ${exp.company || 'Unbekannt'}`, 14, y);
+      y += 6;
+      doc.setFont(undefined, 'normal');
+      doc.setFontSize(9);
+      doc.text(`Datum: ${exp.date || '–'}  |  Projekt: ${exp.project || '–'}  |  ${exp.paymentName || '–'}`, 14, y);
+      y += 5;
+      doc.text(`Brutto: ${Number(exp.gross).toFixed(2)} ${exp.currency}  →  ${Number(exp.amountEUR).toFixed(2)} EUR`, 14, y);
+      if (exp.net || exp.vat) {
+        y += 5;
+        doc.text(`Netto: ${exp.net != null ? Number(exp.net).toFixed(2) : '–'}  |  MwSt: ${exp.vat != null ? Number(exp.vat).toFixed(2) : '–'}`, 14, y);
+      }
+      if (exp.note) {
+        y += 5;
+        doc.text(`Notiz: ${exp.note}`, 14, y);
+      }
+      y += 10;
+      totalEUR += Number(exp.amountEUR) || 0;
+    });
+
+    y += 6;
+    doc.setFontSize(12);
+    doc.setFont(undefined, 'bold');
+    doc.text(`Gesamtsumme: ${totalEUR.toFixed(2)} EUR`, 14, y);
+
+    doc.save(`Spesen_${from || 'alle'}_${to || 'bis_heute'}.pdf`);
+  });
+
+  // ---- Automatisierte Bon-Archivierung (ZIP) ----
+  $('btn-archive-zip')?.addEventListener('click', async () => {
+    const filtered = await getFilteredExpenses();
+    if (filtered.length === 0) {
+      alert('Keine Spesen im gewählten Zeitraum.');
+      return;
+    }
+
+    if (typeof JSZip === 'undefined') {
+      alert('JSZip konnte nicht geladen werden. Bitte Seite neu laden.');
+      return;
+    }
+
+    const btn = $('btn-archive-zip');
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Archiv wird erstellt…';
+
+    try {
+      const zip = new JSZip();
+      const folder = zip.folder('Bons');
+      const meta = [];
+
+      for (let i = 0; i < filtered.length; i++) {
+        const exp = filtered[i];
+        const baseName = makeArchiveFilename(exp, i);
+
+        // Bild speichern (falls vorhanden)
+        if (exp.image) {
+          // data:image/jpeg;base64,... → reines Base64
+          const base64Data = exp.image.split(',')[1] || exp.image;
+          const ext = exp.image.includes('image/png') ? 'png' : 'jpg';
+          folder.file(`${baseName}.${ext}`, base64Data, { base64: true });
+        }
+
+        // Metadaten für CSV/JSON
+        meta.push({
+          nr: i + 1,
+          datei: exp.image ? `${baseName}.jpg` : '',
+          datum: exp.date || '',
+          firma: exp.company || '',
+          brutto: exp.gross != null ? Number(exp.gross).toFixed(2) : '',
+          netto: exp.net != null ? Number(exp.net).toFixed(2) : '',
+          mwst: exp.vat != null ? Number(exp.vat).toFixed(2) : '',
+          waehrung: exp.currency || 'EUR',
+          betrag_eur: exp.amountEUR != null ? Number(exp.amountEUR).toFixed(2) : '',
+          projekt: exp.project || '',
+          zahlungsmittel: exp.paymentName || '',
+          kategorie: exp.category || '',
+          notiz: exp.note || '',
+          erfasst_am: exp.createdAt || ''
+        });
+      }
+
+      // JSON-Metadaten
+      zip.file('metadaten.json', JSON.stringify(meta, null, 2));
+
+      // CSV (deutsch, Semikolon)
+      const csvHeader = 'Nr;Datei;Datum;Firma;Brutto;Netto;MwSt;Waehrung;Betrag_EUR;Projekt;Zahlungsmittel;Kategorie;Notiz;Erfasst_am';
+      const csvRows = meta.map(m =>
+        [m.nr, m.datei, m.datum, m.firma, m.brutto, m.netto, m.mwst, m.waehrung, m.betrag_eur, m.projekt, m.zahlungsmittel, m.kategorie, `"${(m.notiz || '').replace(/"/g, '""')}"`, m.erfasst_am].join(';')
+      );
+      const csvContent = '\uFEFF' + csvHeader + '\n' + csvRows.join('\n'); // BOM für Excel
+      zip.file('metadaten.csv', csvContent);
+
+      // README
+      zip.file('README.txt',
+`SpesenTracker – Automatisierte Bon-Archivierung
+==============================================
+Erstellt am: ${new Date().toLocaleString('de-DE')}
+Anzahl Bons: ${filtered.length}
+
+Inhalt:
+- Bons/          → Quittungsbilder mit sprechenden Dateinamen
+- metadaten.csv  → Übersicht (Excel-tauglich, Semikolon)
+- metadaten.json → Maschinenlesbare Metadaten
+
+Dateinamen-Schema:
+  001_2026-09-22_REWE_12,34EUR.jpg
+`);
+
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      const from = $('export-from').value || 'alle';
+      const to = $('export-to').value || 'bis_heute';
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Spesen_Archiv_${from}_${to}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      alert(`Archiv mit ${filtered.length} Bon(s) wurde heruntergeladen.`);
+    } catch (err) {
+      console.error(err);
+      alert('Fehler beim Erstellen des Archivs: ' + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  });
+}
+
+// ========== Google Drive Sync (Steuerberater-Struktur) ==========
+/*
+  Struktur in Drive:
+  SpesenTracker/
+  ├── 2026-09/
+  │   ├── 001_2026-09-15_REWE_23,45EUR.jpg
+  │   ├── 002_...
+  │   ├── Spesen_2026-09.pdf
+  │   ├── metadaten_2026-09.csv
+  │   └── metadaten_2026-09.json
+  └── 2026-10/
+      └── ...
+*/
+
+const DRIVE_ROOT_NAME = 'SpesenTracker';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+
+let googleTokenClient = null;
+let googleAccessToken = null;
+let gapiInited = false;
+let gisInited = false;
+
+function loadGoogleClientId() {
+  return localStorage.getItem('spesen_google_client_id') || '';
+}
+
+function saveGoogleClientId(id) {
+  localStorage.setItem('spesen_google_client_id', id || '');
+}
+
+function updateDriveStatusUI() {
+  const statusEl = $('drive-status');
+  const syncStatus = $('drive-sync-status');
+  const connectBtn = $('btn-google-connect');
+  const disconnectBtn = $('btn-google-disconnect');
+  const syncBtn = $('btn-drive-sync');
+  const headerSync = $('btn-sync');
+
+  if (googleAccessToken) {
+    if (statusEl) statusEl.textContent = 'Status: Verbunden ✓';
+    if (connectBtn) hide(connectBtn);
+    if (disconnectBtn) show(disconnectBtn);
+    if (syncBtn) syncBtn.disabled = false;
+    if (headerSync) headerSync.disabled = false;
+  } else {
+    if (statusEl) statusEl.textContent = 'Status: Nicht verbunden';
+    if (connectBtn) show(connectBtn);
+    if (disconnectBtn) hide(disconnectBtn);
+    if (syncBtn) syncBtn.disabled = true;
+    if (headerSync) headerSync.disabled = true;
+  }
+}
+
+function initGoogleApis() {
+  const clientId = loadGoogleClientId();
+  if (!clientId) {
+    updateDriveStatusUI();
+    return;
+  }
+
+  // GIS Token Client
+  if (window.google?.accounts?.oauth2) {
+    googleTokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: DRIVE_SCOPE,
+      callback: (resp) => {
+        if (resp.error) {
+          console.error('Google Auth Fehler', resp);
+          alert('Google-Anmeldung fehlgeschlagen: ' + (resp.error_description || resp.error));
+          return;
+        }
+        googleAccessToken = resp.access_token;
+        localStorage.setItem('spesen_google_token', googleAccessToken);
+        updateDriveStatusUI();
+        alert('Erfolgreich mit Google verbunden!');
+      }
+    });
+    gisInited = true;
+  }
+
+  // gapi client for Drive
+  if (window.gapi) {
+    gapi.load('client', async () => {
+      try {
+        await gapi.client.init({
+          discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest']
+        });
+        gapiInited = true;
+        // Restore token if still valid-ish
+        const saved = localStorage.getItem('spesen_google_token');
+        if (saved) {
+          googleAccessToken = saved;
+          gapi.client.setToken({ access_token: saved });
+        }
+        updateDriveStatusUI();
+      } catch (e) {
+        console.warn('gapi init', e);
+      }
+    });
+  }
+}
+
+function connectGoogle() {
+  const clientId = ($('google-client-id')?.value || '').trim() || loadGoogleClientId();
+  if (!clientId) {
+    alert('Bitte zuerst die Google Cloud Client-ID eintragen und speichern.');
+    return;
+  }
+  saveGoogleClientId(clientId);
+  if ($('google-client-id')) $('google-client-id').value = clientId;
+
+  if (!googleTokenClient) {
+    initGoogleApis();
+    // Kurz warten bis GIS geladen
+    setTimeout(() => {
+      if (googleTokenClient) {
+        googleTokenClient.requestAccessToken({ prompt: 'consent' });
+      } else {
+        alert('Google-Skript noch nicht geladen. Seite neu laden und erneut versuchen.');
+      }
+    }, 800);
+    return;
+  }
+  googleTokenClient.requestAccessToken({ prompt: googleAccessToken ? '' : 'consent' });
+}
+
+function disconnectGoogle() {
+  googleAccessToken = null;
+  localStorage.removeItem('spesen_google_token');
+  if (window.gapi?.client) gapi.client.setToken(null);
+  updateDriveStatusUI();
+}
+
+/** Findet oder erstellt einen Ordner und gibt die ID zurück */
+async function findOrCreateFolder(name, parentId = null) {
+  let q = `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  if (parentId) q += ` and '${parentId}' in parents`;
+
+  const listRes = await gapi.client.drive.files.list({
+    q,
+    fields: 'files(id, name)',
+    spaces: 'drive'
+  });
+
+  if (listRes.result.files && listRes.result.files.length > 0) {
+    return listRes.result.files[0].id;
+  }
+
+  const meta = {
+    name,
+    mimeType: 'application/vnd.google-apps.folder'
+  };
+  if (parentId) meta.parents = [parentId];
+
+  const createRes = await gapi.client.drive.files.create({
+    resource: meta,
+    fields: 'id'
+  });
+  return createRes.result.id;
+}
+
+/** Lädt eine Datei (Blob oder Base64) zu Drive hoch */
+async function uploadToDrive(name, content, mimeType, parentId) {
+  // content kann Blob, ArrayBuffer oder base64-string (ohne prefix) sein
+  let body;
+  if (content instanceof Blob) {
+    body = content;
+  } else if (typeof content === 'string' && content.startsWith('data:')) {
+    // data-URL → Blob
+    const res = await fetch(content);
+    body = await res.blob();
+  } else if (typeof content === 'string') {
+    // pure base64
+    const byteChars = atob(content);
+    const bytes = new Uint8Array(byteChars.length);
+    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
+    body = new Blob([bytes], { type: mimeType });
+  } else {
+    body = content;
+  }
+
+  const metadata = {
+    name,
+    parents: parentId ? [parentId] : undefined
+  };
+
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+  form.append('file', body);
+
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + googleAccessToken
+    },
+    body: form
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error('Upload fehlgeschlagen: ' + err);
+  }
+  return res.json();
+}
+
+/** Gruppiert Spesen nach Monat (YYYY-MM) */
+function groupByMonth(expenses) {
+  const groups = {};
+  expenses.forEach(exp => {
+    const key = (exp.date || 'ohne-datum').slice(0, 7); // YYYY-MM
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(exp);
+  });
+  return groups;
+}
+
+/** Erzeugt PDF-Blob für eine Liste von Spesen */
+function createPdfBlob(expenses, monthLabel) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+  let y = 20;
+
+  doc.setFontSize(16);
+  doc.text(`Spesenabrechnung ${monthLabel}`, 14, y);
+  y += 8;
+  doc.setFontSize(10);
+  doc.text(`Erstellt am: ${new Date().toLocaleDateString('de-DE')}`, 14, y);
+  y += 12;
+
+  let totalEUR = 0;
+  expenses.forEach((exp, idx) => {
+    if (y > 270) { doc.addPage(); y = 20; }
+    doc.setFontSize(11);
+    doc.setFont(undefined, 'bold');
+    doc.text(`${idx + 1}. ${exp.company || 'Unbekannt'}`, 14, y);
+    y += 6;
+    doc.setFont(undefined, 'normal');
+    doc.setFontSize(9);
+    doc.text(`Datum: ${exp.date || '–'}  |  Projekt: ${exp.project || '–'}  |  ${exp.paymentName || '–'}`, 14, y);
+    y += 5;
+    doc.text(`Brutto: ${Number(exp.gross).toFixed(2)} ${exp.currency}  →  ${Number(exp.amountEUR).toFixed(2)} EUR`, 14, y);
+    if (exp.net || exp.vat) {
+      y += 5;
+      doc.text(`Netto: ${exp.net != null ? Number(exp.net).toFixed(2) : '–'}  |  MwSt: ${exp.vat != null ? Number(exp.vat).toFixed(2) : '–'}`, 14, y);
+    }
+    y += 10;
+    totalEUR += Number(exp.amountEUR) || 0;
+  });
+
+  y += 6;
+  doc.setFontSize(12);
+  doc.setFont(undefined, 'bold');
+  doc.text(`Gesamtsumme: ${totalEUR.toFixed(2)} EUR`, 14, y);
+
+  return doc.output('blob');
+}
+
+/** Hauptfunktion: Sync zum Steuerberater-freundlichen Drive-Ordner */
+async function syncToDrive() {
+  if (!googleAccessToken) {
+    alert('Bitte zuerst in den Einstellungen mit Google verbinden.');
+    return;
+  }
+  if (!gapiInited) {
+    alert('Google API noch nicht bereit. Kurz warten und erneut versuchen.');
+    return;
+  }
+
+  gapi.client.setToken({ access_token: googleAccessToken });
+
+  const filtered = await getFilteredExpenses();
+  if (filtered.length === 0) {
+    alert('Keine Spesen im gewählten Zeitraum.');
+    return;
+  }
+
+  const statusEl = $('drive-sync-status');
+  const btn = $('btn-drive-sync');
+  const headerBtn = $('btn-sync');
+  const setStatus = (msg) => {
+    if (statusEl) statusEl.textContent = msg;
+  };
+
+  if (btn) { btn.disabled = true; btn.textContent = 'Synchronisiere…'; }
+  if (headerBtn) headerBtn.disabled = true;
+
+  try {
+    setStatus('Root-Ordner prüfen…');
+    const rootId = await findOrCreateFolder(DRIVE_ROOT_NAME);
+
+    const groups = groupByMonth(filtered);
+    const months = Object.keys(groups).sort();
+
+    for (const month of months) {
+      const expenses = groups[month];
+      setStatus(`Monat ${month}: Ordner anlegen…`);
+      const monthId = await findOrCreateFolder(month, rootId);
+
+      // Bilder hochladen
+      for (let i = 0; i < expenses.length; i++) {
+        const exp = expenses[i];
+        if (!exp.image) continue;
+        const baseName = makeArchiveFilename(exp, i);
+        const ext = exp.image.includes('image/png') ? 'png' : 'jpg';
+        setStatus(`Monat ${month}: Bild ${i + 1}/${expenses.length}…`);
+        await uploadToDrive(`${baseName}.${ext}`, exp.image, ext === 'png' ? 'image/png' : 'image/jpeg', monthId);
+      }
+
+      // Metadaten CSV + JSON
+      const meta = expenses.map((exp, i) => ({
+        nr: i + 1,
+        datei: exp.image ? `${makeArchiveFilename(exp, i)}.jpg` : '',
+        datum: exp.date || '',
+        firma: exp.company || '',
+        brutto: exp.gross != null ? Number(exp.gross).toFixed(2) : '',
+        netto: exp.net != null ? Number(exp.net).toFixed(2) : '',
+        mwst: exp.vat != null ? Number(exp.vat).toFixed(2) : '',
+        waehrung: exp.currency || 'EUR',
+        betrag_eur: exp.amountEUR != null ? Number(exp.amountEUR).toFixed(2) : '',
+        projekt: exp.project || '',
+        zahlungsmittel: exp.paymentName || '',
+        kategorie: exp.category || '',
+        notiz: exp.note || ''
+      }));
+
+      const csvHeader = 'Nr;Datei;Datum;Firma;Brutto;Netto;MwSt;Waehrung;Betrag_EUR;Projekt;Zahlungsmittel;Kategorie;Notiz';
+      const csvRows = meta.map(m =>
+        [m.nr, m.datei, m.datum, m.firma, m.brutto, m.netto, m.mwst, m.waehrung, m.betrag_eur, m.projekt, m.zahlungsmittel, m.kategorie, `"${(m.notiz || '').replace(/"/g, '""')}"`].join(';')
+      );
+      const csvContent = '\uFEFF' + csvHeader + '\n' + csvRows.join('\n');
+      const csvBlob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
+      const jsonBlob = new Blob([JSON.stringify(meta, null, 2)], { type: 'application/json' });
+
+      setStatus(`Monat ${month}: Metadaten…`);
+      await uploadToDrive(`metadaten_${month}.csv`, csvBlob, 'text/csv', monthId);
+      await uploadToDrive(`metadaten_${month}.json`, jsonBlob, 'application/json', monthId);
+
+      // PDF-Zusammenfassung
+      setStatus(`Monat ${month}: PDF…`);
+      const pdfBlob = createPdfBlob(expenses, month);
+      await uploadToDrive(`Spesen_${month}.pdf`, pdfBlob, 'application/pdf', monthId);
+    }
+
+    setStatus(`Fertig! ${filtered.length} Bon(s) in ${months.length} Monat(en) hochgeladen.`);
+    alert(`Sync erfolgreich!\n\nOrdner: SpesenTracker\nMonate: ${months.join(', ')}\nAnzahl Bons: ${filtered.length}`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Fehler: ' + err.message);
+    alert('Drive-Sync fehlgeschlagen:\n' + err.message + '\n\nToken evtl. abgelaufen – bitte neu verbinden.');
+    // Token invalid → zurücksetzen
+    if (String(err.message).includes('401') || String(err.message).includes('Invalid Credentials')) {
+      disconnectGoogle();
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '☁ Zu Google Drive hochladen'; }
+    if (headerBtn) headerBtn.disabled = false;
+    updateDriveStatusUI();
+  }
+}
+
+function setupGoogleDrive() {
+  // Client-ID aus LocalStorage laden
+  const savedId = loadGoogleClientId();
+  if ($('google-client-id') && savedId) {
+    $('google-client-id').value = savedId;
+  }
+
+  $('btn-google-connect')?.addEventListener('click', () => {
+    const id = ($('google-client-id')?.value || '').trim();
+    if (id) saveGoogleClientId(id);
+    connectGoogle();
+  });
+
+  $('btn-google-disconnect')?.addEventListener('click', disconnectGoogle);
+
+  $('btn-drive-sync')?.addEventListener('click', syncToDrive);
+  $('btn-sync')?.addEventListener('click', syncToDrive);
+
+  // Client-ID speichern bei Änderung
+  $('google-client-id')?.addEventListener('change', (e) => {
+    saveGoogleClientId(e.target.value.trim());
+  });
+
+  // Google-Skripte brauchen etwas Zeit
+  const tryInit = () => {
+    if (window.google?.accounts || window.gapi) {
+      initGoogleApis();
+    } else {
+      setTimeout(tryInit, 400);
+    }
+  };
+  tryInit();
+  updateDriveStatusUI();
+}
+
+// ========== Init ==========
+async function init() {
+  await openDB();
+  await fetchRates();
+  setToday();
+  await loadPaymentMethods();
+  await loadProjects();
+
+  // Default payment methods if empty
+  const pms = await dbGetAll(STORE_PAYMENTS);
+  if (pms.length === 0) {
+    await dbAdd(STORE_PAYMENTS, { name: 'Bar', ending: null, type: 'cash' });
+    await dbAdd(STORE_PAYMENTS, { name: 'Firmenkreditkarte', ending: null, type: 'card' });
+    await loadPaymentMethods();
+  }
+
+  setupTabs();
+  setupUpload();
+  setupPaymentModals();
+  setupSettings();
+  setupExport();
+  setupGoogleDrive();
+
+  $('currency').addEventListener('change', updateEUR);
+  $('amount-gross').addEventListener('input', updateEUR);
+  $('expense-form').addEventListener('submit', handleSave);
+  $('search-list')?.addEventListener('input', (e) => renderExpenseList(e.target.value));
+
+  // Service Worker
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(console.warn);
+  }
+
+  console.log('SpesenTracker bereit');
+}
+
+document.addEventListener('DOMContentLoaded', init);

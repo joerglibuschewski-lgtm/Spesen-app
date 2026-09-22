@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>SpesenTracker</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Tesseract.js -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <!-- jsPDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <!-- JSZip für Archiv -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <!-- Google Identity Services + Drive API -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://apis.google.com/js/api.js" async defer></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header class="header">
+      <h1>SpesenTracker</h1>
+      <div class="header-actions">
+        <button id="btn-sync" class="icon-btn" title="Zu Google Drive synchronisieren">☁</button>
+        <button id="btn-settings" class="icon-btn" title="Einstellungen">⚙</button>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tabs">
+      <button class="tab active" data-tab="new">Neu</button>
+      <button class="tab" data-tab="list">Liste</button>
+      <button class="tab" data-tab="export">Export</button>
+    </nav>
+
+    <!-- Tab: Neue Quittung -->
+    <section id="tab-new" class="tab-content active">
+      <div class="card">
+        <h2>Quittung erfassen</h2>
+
+        <!-- Bild-Aufnahme -->
+        <div class="upload-area" id="upload-area">
+          <input type="file" id="receipt-input" accept="image/*" capture="environment" hidden />
+          <div class="upload-placeholder" id="upload-placeholder">
+            <span class="upload-icon">📷</span>
+            <p>Tippen zum Fotografieren<br>oder Galerie öffnen</p>
+          </div>
+          <img id="receipt-preview" class="receipt-preview hidden" alt="Quittungsvorschau" />
+        </div>
+
+        <div id="ocr-status" class="ocr-status hidden">
+          <div class="spinner"></div>
+          <span id="ocr-text">Analysiere Quittung…</span>
+        </div>
+
+        <!-- Erkannte / manuelle Daten -->
+        <form id="expense-form" class="form">
+          <div class="form-group">
+            <label for="company">Firma / Händler</label>
+            <input type="text" id="company" placeholder="z. B. Tankstelle, Restaurant…" required />
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="amount-gross">Brutto</label>
+              <input type="number" id="amount-gross" step="0.01" min="0" placeholder="0.00" required />
+            </div>
+            <div class="form-group">
+              <label for="amount-net">Netto</label>
+              <input type="number" id="amount-net" step="0.01" min="0" placeholder="0.00" />
+            </div>
+            <div class="form-group">
+              <label for="amount-vat">MwSt</label>
+              <input type="number" id="amount-vat" step="0.01" min="0" placeholder="0.00" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="currency">Währung</label>
+              <select id="currency">
+                <option value="EUR" selected>EUR</option>
+                <option value="CHF">CHF</option>
+                <option value="USD">USD</option>
+                <option value="GBP">GBP</option>
+                <option value="PLN">PLN</option>
+                <option value="CZK">CZK</option>
+                <option value="HUF">HUF</option>
+                <option value="SEK">SEK</option>
+                <option value="NOK">NOK</option>
+                <option value="DKK">DKK</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="amount-eur">Betrag in EUR</label>
+              <input type="number" id="amount-eur" step="0.01" readonly class="readonly" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="date">Datum</label>
+            <input type="date" id="date" required />
+          </div>
+
+          <div class="form-group">
+            <label for="project">Projekt</label>
+            <input type="text" id="project" list="project-list" placeholder="Projektname eingeben oder wählen" />
+            <datalist id="project-list"></datalist>
+          </div>
+
+          <div class="form-group">
+            <label for="payment-method">Zahlungsmittel</label>
+            <select id="payment-method">
+              <option value="">– bitte wählen –</option>
+            </select>
+            <button type="button" id="btn-add-payment" class="link-btn">+ Neues Zahlungsmittel</button>
+          </div>
+
+          <!-- Karten-Erkennung Vorschlag -->
+          <div id="card-suggestion" class="card-suggestion hidden">
+            <p>Erkannte Karte: <strong id="suggested-card"></strong></p>
+            <div class="suggestion-actions">
+              <button type="button" id="btn-accept-card" class="btn btn-primary btn-sm">Ja, übernehmen</button>
+              <button type="button" id="btn-reject-card" class="btn btn-secondary btn-sm">Nein</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="category">Kategorie</label>
+            <select id="category">
+              <option value="Verpflegung">Verpflegung</option>
+              <option value="Transport">Transport</option>
+              <option value="Übernachtung">Übernachtung</option>
+              <option value="Material">Material</option>
+              <option value="Sonstiges">Sonstiges</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="note">Notiz</label>
+            <textarea id="note" rows="2" placeholder="Optional…"></textarea>
+          </div>
+
+          <button type="submit" class="btn btn-primary btn-block" id="btn-save">Speichern</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- Tab: Liste -->
+    <section id="tab-list" class="tab-content">
+      <div class="card">
+        <div class="list-header">
+          <h2>Meine Spesen</h2>
+          <input type="search" id="search-list" placeholder="Suchen…" />
+        </div>
+        <div id="expense-list" class="expense-list">
+          <!-- dynamisch gefüllt -->
+        </div>
+        <p id="empty-list" class="empty-state">Noch keine Spesen erfasst.</p>
+      </div>
+    </section>
+
+    <!-- Tab: Export / Archiv -->
+    <section id="tab-export" class="tab-content">
+      <div class="card">
+        <h2>Zeitraum</h2>
+        <p class="hint">Wähle den Zeitraum für Export und Archivierung.</p>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="export-from">Von</label>
+            <input type="date" id="export-from" />
+          </div>
+          <div class="form-group">
+            <label for="export-to">Bis</label>
+            <input type="date" id="export-to" />
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>PDF-Export</h2>
+        <p class="hint">Erstellt ein übersichtliches PDF mit allen Spesen des Zeitraums.</p>
+        <button id="btn-generate-pdf" class="btn btn-primary btn-block">📄 PDF erstellen & herunterladen</button>
+        <button id="btn-mailto" class="btn btn-secondary btn-block" disabled>Per E-Mail senden (Mailto)</button>
+      </div>
+
+      <div class="card">
+        <h2>Automatisierte Bon-Archivierung</h2>
+        <p class="hint">
+          Erstellt ein ZIP-Archiv mit allen Quittungsbildern (sinnvolle Dateinamen) 
+          + CSV und JSON der Metadaten. Ideal zur Ablage oder für den Steuerberater.
+        </p>
+        <button id="btn-archive-zip" class="btn btn-primary btn-block">📦 Archiv (ZIP) herunterladen</button>
+        <p class="hint" style="margin-top:0.75rem">
+          Dateinamen-Schema:<br>
+          <code>YYYY-MM-DD_Firma_12.34EUR.jpg</code>
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Google Drive Sync (Steuerberater)</h2>
+        <p class="hint">
+          Lädt die Bons des gewählten Zeitraums strukturiert in Google Drive hoch:
+          Ordner <strong>SpesenTracker / YYYY-MM</strong> mit Bildern, PDF und CSV.
+        </p>
+        <button id="btn-drive-sync" class="btn btn-primary btn-block">☁ Zu Google Drive hochladen</button>
+        <p id="drive-sync-status" class="hint" style="margin-top:0.5rem"></p>
+      </div>
+    </section>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>Einstellungen</h2>
+          <button id="btn-close-settings" class="icon-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <h3>Zahlungsmittel verwalten</h3>
+          <ul id="payment-methods-list" class="settings-list"></ul>
+          <button id="btn-new-payment" class="btn btn-secondary btn-block">+ Zahlungsmittel hinzufügen</button>
+
+          <h3 style="margin-top:1.5rem">Projekte</h3>
+          <p class="hint">Projekte werden automatisch aus deinen Eingaben gelernt.</p>
+
+          <h3 style="margin-top:1.5rem">Google Drive (für Steuerberater)</h3>
+          <p class="hint">
+            Die App legt einen Ordner <strong>SpesenTracker</strong> an und darin
+            monatliche Unterordner (z. B. 2026-09) mit Bildern, PDF und CSV.
+          </p>
+          <div class="form-group">
+            <label for="google-client-id">Google Cloud Client-ID</label>
+            <input type="text" id="google-client-id" placeholder="xxxxxxxx.apps.googleusercontent.com" />
+          </div>
+          <p id="drive-status" class="hint">Status: Nicht verbunden</p>
+          <button id="btn-google-connect" class="btn btn-primary btn-block">Mit Google verbinden</button>
+          <button id="btn-google-disconnect" class="btn btn-secondary btn-block hidden">Verbindung trennen</button>
+          <p class="hint" style="margin-top:0.75rem">
+            Anleitung: Google Cloud Console → Neues Projekt → APIs & Dienste → 
+            Google Drive API aktivieren → OAuth-Zustimmungsbildschirm → 
+            Anmeldedaten → OAuth-Client-ID (Webanwendung) erstellen. 
+            Autorisierte JavaScript-Ursprünge: deine App-URL (z. B. http://localhost:5500).
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add Payment Method Modal -->
+    <div id="payment-modal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>Zahlungsmittel</h2>
+          <button id="btn-close-payment" class="icon-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="pm-name">Bezeichnung</label>
+            <input type="text" id="pm-name" placeholder="z. B. Visa Firmenkarte" />
+          </div>
+          <div class="form-group">
+            <label for="pm-ending">Karten-Endung (optional, 4 Ziffern)</label>
+            <input type="text" id="pm-ending" maxlength="4" pattern="[0-9]{4}" placeholder="1234" />
+          </div>
+          <div class="form-group">
+            <label for="pm-type">Typ</label>
+            <select id="pm-type">
+              <option value="card">Karte</option>
+              <option value="cash">Bar</option>
+              <option value="transfer">Überweisung</option>
+              <option value="other">Sonstiges</option>
+            </select>
+          </div>
+          <button id="btn-save-payment" class="btn btn-primary btn-block">Speichern</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
