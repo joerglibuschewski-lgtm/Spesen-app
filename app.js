@@ -83,20 +83,20 @@ function dbDelete(storeName, key) {
 // ========== Währungskurse ==========
 async function fetchRates() {
   try {
-    const res = await fetch('https://api.frankfurter.app/latest?from=EUR');
+    // frankfurter.dev ist der aktuelle Endpoint (unterstützt u.a. SAR, AED)
+    const res = await fetch('https://api.frankfurter.dev/v1/latest?base=EUR');
     if (!res.ok) throw new Error('Rate fetch failed');
     const data = await res.json();
-    // frankfurter liefert Kurse als EUR -> andere. Wir brauchen inverse für Umrechnung in EUR.
     currentRates = { EUR: 1 };
-    for (const [cur, rate] of Object.entries(data.rates)) {
+    for (const [cur, rate] of Object.entries(data.rates || {})) {
       currentRates[cur] = rate; // 1 EUR = rate CUR
     }
     console.log('Kurse geladen', currentRates);
   } catch (err) {
     console.warn('Kurse konnten nicht geladen werden, verwende Cache/Fallback', err);
-    // Fallback grobe Kurse
+    // Fallback (ca. Werte Sept 2026)
     currentRates = {
-      EUR: 1, CHF: 0.94, USD: 1.08, GBP: 0.85,
+      EUR: 1, SAR: 4.05, AED: 3.95, CHF: 0.94, USD: 1.08, GBP: 0.85,
       PLN: 4.3, CZK: 25.2, HUF: 395, SEK: 11.4, NOK: 11.6, DKK: 7.46
     };
   }
@@ -116,9 +116,23 @@ function convertToEUR(amount, currency) {
 
 function parseGermanAmount(str) {
   if (!str) return null;
-  // 1.234,56 oder 1234,56 oder 12,34 → Number
-  const cleaned = String(str).replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
-  const num = parseFloat(cleaned);
+  let s = String(str).replace(/\s/g, '');
+  // Östliche arabische Ziffern (٠١٢٣...) → westliche
+  const eastern = '٠١٢٣٤٥٦٧٨٩';
+  const western = '0123456789';
+  for (let i = 0; i < 10; i++) {
+    s = s.replaceAll(eastern[i], western[i]);
+  }
+  // Deutsche Schreibweise: 1.234,56 oder 1234,56 oder 12,34
+  // Auch englische: 1,234.56
+  if (/\d,\d{2}$/.test(s) && !/\.\d{2}$/.test(s)) {
+    // Komma als Dezimaltrenner (DE)
+    s = s.replace(/\./g, '').replace(',', '.');
+  } else {
+    // Punkt als Dezimaltrenner (EN/INT)
+    s = s.replace(/,/g, '');
+  }
+  const num = parseFloat(s);
   return isNaN(num) ? null : num;
 }
 
@@ -457,14 +471,18 @@ function setupUpload() {
       preview.classList.remove('hidden');
       placeholder.classList.add('hidden');
 
-      // OCR starten
+      // OCR starten – unterstützt Deutsch, Englisch und Arabisch (für saudische/arabische Bons)
       show($('ocr-status'));
-      $('ocr-text').textContent = 'Analysiere Quittung…';
+      $('ocr-text').textContent = 'Analysiere Quittung… (lädt Sprachmodell)';
       try {
-        const { data: { text } } = await Tesseract.recognize(currentImageBase64, 'deu+eng', {
+        // ara = Arabisch, eng = Englisch, deu = Deutsch
+        // Tesseract lädt die Modelle bei Bedarf nach (kann beim ersten Mal länger dauern)
+        const { data: { text } } = await Tesseract.recognize(currentImageBase64, 'ara+eng+deu', {
           logger: m => {
             if (m.status === 'recognizing text') {
               $('ocr-text').textContent = `Analysiere… ${Math.round(m.progress * 100)}%`;
+            } else if (m.status === 'loading language traineddata') {
+              $('ocr-text').textContent = 'Lade Sprachmodell…';
             }
           }
         });
