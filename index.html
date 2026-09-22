@@ -49,7 +49,16 @@
             <span class="upload-icon">📷</span>
             <p>Tippen zum Fotografieren<br>oder Galerie öffnen</p>
           </div>
-          <img id="receipt-preview" class="receipt-preview hidden" alt="Quittungsvorschau" />
+          <div id="preview-wrap" class="preview-wrap hidden">
+            <canvas id="crop-canvas" class="crop-canvas"></canvas>
+            <img id="receipt-preview" class="receipt-preview hidden" alt="Quittungsvorschau" />
+          </div>
+        </div>
+
+        <div id="crop-actions" class="crop-actions hidden">
+          <p class="hint crop-hint">Graue Bereiche werden abgeschnitten. Rahmen an den <strong>grünen Griffen</strong> ziehen zum Anpassen.</p>
+          <button type="button" id="btn-confirm-crop" class="btn btn-primary btn-block">✂ Zuschneiden &amp; analysieren</button>
+          <button type="button" id="btn-skip-crop" class="btn btn-secondary btn-block">Ohne Zuschnitt analysieren</button>
         </div>
 
         <div id="ocr-status" class="ocr-status hidden">

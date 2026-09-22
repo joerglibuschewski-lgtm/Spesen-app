@@ -586,102 +586,432 @@ async function runVisionOCR(dataUrl) {
   return text;
 }
 
-/**
- * Beleg aufbereiten: skalieren, Inhaltsbereich zuschneiden,
- * Graustufen + starker Kontrast → besser lesbar für Archiv & OCR
- */
-function preprocessImage(dataUrl, opts = {}) {
-  const forArchive = opts.forArchive !== false;
-  return new Promise((resolve) => {
+/** Lädt Bild in Canvas, skaliert auf maxSide */
+function loadImageToCanvas(dataUrl, maxSide = 1800) {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      try {
-        // 1) Auf sinnvolle Größe skalieren
-        const maxSide = forArchive ? 1800 : 1600;
-        let w = img.width;
-        let h = img.height;
-        if (w > maxSide || h > maxSide) {
-          const scale = maxSide / Math.max(w, h);
-          w = Math.round(w * scale);
-          h = Math.round(h * scale);
-        }
-
-        const canvas = document.createElement('canvas');
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, w, h);
-
-        let imageData = ctx.getImageData(0, 0, w, h);
-        let d = imageData.data;
-
-        // 2) Graustufen + Kontrast
-        const contrast = 1.55;
-        const intercept = 128 * (1 - contrast);
-        for (let i = 0; i < d.length; i += 4) {
-          let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-          gray = contrast * gray + intercept;
-          // Leichte Aufhellung dunkler Flächen (Thermobons)
-          if (gray < 40) gray = gray * 0.5;
-          gray = Math.max(0, Math.min(255, gray));
-          d[i] = d[i + 1] = d[i + 2] = gray;
-        }
-
-        // 3) Auto-Crop: Inhaltsbereich finden (Pixel die nicht fast weiß sind)
-        const threshold = 245;
-        let minX = w, minY = h, maxX = 0, maxY = 0;
-        const step = Math.max(1, Math.floor(Math.min(w, h) / 400));
-        for (let y = 0; y < h; y += step) {
-          for (let x = 0; x < w; x += step) {
-            const idx = (y * w + x) * 4;
-            if (d[idx] < threshold) {
-              if (x < minX) minX = x;
-              if (y < minY) minY = y;
-              if (x > maxX) maxX = x;
-              if (y > maxY) maxY = y;
-            }
-          }
-        }
-
-        // Padding und Plausibilität
-        const pad = Math.round(Math.min(w, h) * 0.02);
-        minX = Math.max(0, minX - pad);
-        minY = Math.max(0, minY - pad);
-        maxX = Math.min(w - 1, maxX + pad);
-        maxY = Math.min(h - 1, maxY + pad);
-
-        const cropW = maxX - minX;
-        const cropH = maxY - minY;
-        const areaRatio = (cropW * cropH) / (w * h);
-
-        // Nur croppen wenn sinnvoll (nicht fast leer / nicht winzig)
-        if (cropW > 40 && cropH > 40 && areaRatio > 0.08 && areaRatio < 0.98) {
-          const cropped = ctx.getImageData(minX, minY, cropW, cropH);
-          canvas.width = cropW;
-          canvas.height = cropH;
-          ctx.putImageData(cropped, 0, 0);
-        } else {
-          ctx.putImageData(imageData, 0, 0);
-        }
-
-        resolve(canvas.toDataURL('image/jpeg', 0.9));
-      } catch (e) {
-        console.warn('preprocess failed', e);
-        resolve(dataUrl);
+      let w = img.width;
+      let h = img.height;
+      if (w > maxSide || h > maxSide) {
+        const scale = maxSide / Math.max(w, h);
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
       }
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      resolve({ canvas, ctx, w, h, img });
     };
-    img.onerror = () => resolve(dataUrl);
+    img.onerror = reject;
     img.src = dataUrl;
   });
 }
+
+/** Findet Beleg-Rechteck (Inhalt vs. Hintergrund) */
+function detectReceiptBounds(ctx, w, h) {
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const d = imageData.data;
+
+  // Graustufen-Kopie für Schwellwert
+  const gray = new Uint8Array(w * h);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    gray[p] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
+  }
+
+  // Adaptive Schwelle: Hintergrund oft hell → Inhalt dunkler
+  let sum = 0;
+  for (let i = 0; i < gray.length; i += 17) sum += gray[i];
+  const samples = Math.ceil(gray.length / 17);
+  const avg = sum / samples;
+  const threshold = Math.min(242, Math.max(160, avg * 0.92 + 40));
+
+  let minX = w, minY = h, maxX = 0, maxY = 0;
+  const step = Math.max(1, Math.floor(Math.min(w, h) / 500));
+  let found = 0;
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      if (gray[y * w + x] < threshold) {
+        found++;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (found < 30) {
+    // Fallback: fast ganzes Bild
+    return { minX: 0, minY: 0, maxX: w - 1, maxY: h - 1, valid: false };
+  }
+
+  const pad = Math.round(Math.min(w, h) * 0.015);
+  minX = Math.max(0, minX - pad);
+  minY = Math.max(0, minY - pad);
+  maxX = Math.min(w - 1, maxX + pad);
+  maxY = Math.min(h - 1, maxY + pad);
+
+  const cropW = maxX - minX;
+  const cropH = maxY - minY;
+  const areaRatio = (cropW * cropH) / (w * h);
+  const valid = cropW > 50 && cropH > 50 && areaRatio > 0.05 && areaRatio < 0.995;
+
+  return { minX, minY, maxX, maxY, valid };
+}
+
+/**
+ * Zeichnet Vorschau: Original + ausgegraute Ränder + Rahmen + Zieh-Griffe an den Kanten
+ */
+function drawCropOverlay(sourceCanvas, bounds) {
+  const canvas = $('crop-canvas');
+  if (!canvas || !sourceCanvas) return;
+  const w = sourceCanvas.width;
+  const h = sourceCanvas.height;
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+
+  ctx.drawImage(sourceCanvas, 0, 0);
+
+  const { minX, minY, maxX, maxY } = bounds;
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.62)';
+  ctx.fillRect(0, 0, w, minY);
+  ctx.fillRect(0, maxY + 1, w, h - maxY - 1);
+  ctx.fillRect(0, minY, minX, maxY - minY + 1);
+  ctx.fillRect(maxX + 1, minY, w - maxX - 1, maxY - minY + 1);
+
+  const lw = Math.max(2, Math.round(Math.min(w, h) / 200));
+  ctx.strokeStyle = '#22c55e';
+  ctx.lineWidth = lw;
+  ctx.strokeRect(minX + 0.5, minY + 0.5, maxX - minX, maxY - minY);
+
+  // Griffe an Kanten + Ecken (gut greifbar auf dem Handy)
+  const hs = Math.max(14, Math.round(Math.min(w, h) / 28));
+  const midX = (minX + maxX) / 2;
+  const midY = (minY + maxY) / 2;
+  const handles = [
+    [minX, minY], [midX, minY], [maxX, minY],
+    [minX, midY],               [maxX, midY],
+    [minX, maxY], [midX, maxY], [maxX, maxY]
+  ];
+  ctx.fillStyle = '#22c55e';
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  handles.forEach(([hx, hy]) => {
+    ctx.beginPath();
+    ctx.rect(hx - hs / 2, hy - hs / 2, hs, hs);
+    ctx.fill();
+    ctx.stroke();
+  });
+}
+
+/** Maus/Touch-Position → Canvas-Koordinaten */
+function canvasPointerPos(canvas, evt) {
+  const rect = canvas.getBoundingClientRect();
+  const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+  const clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return {
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY
+  };
+}
+
+/** Welcher Griff / welche Kante unter dem Pointer? */
+function hitCropHandle(bounds, x, y, canvasW, canvasH) {
+  const { minX, minY, maxX, maxY } = bounds;
+  const edgeHit = Math.max(18, Math.min(canvasW, canvasH) / 22);
+  const cornerHit = edgeHit * 1.2;
+  const near = (a, b, t) => Math.abs(a - b) <= t;
+
+  const onLeft = near(x, minX, edgeHit);
+  const onRight = near(x, maxX, edgeHit);
+  const onTop = near(y, minY, edgeHit);
+  const onBottom = near(y, maxY, edgeHit);
+  const inY = y >= minY - edgeHit && y <= maxY + edgeHit;
+  const inX = x >= minX - edgeHit && x <= maxX + edgeHit;
+
+  if (onLeft && onTop) return 'nw';
+  if (onRight && onTop) return 'ne';
+  if (onLeft && onBottom) return 'sw';
+  if (onRight && onBottom) return 'se';
+  if (onTop && inX) return 'n';
+  if (onBottom && inX) return 's';
+  if (onLeft && inY) return 'w';
+  if (onRight && inY) return 'e';
+
+  // Inneres Rechteck verschieben
+  if (x > minX && x < maxX && y > minY && y < maxY) return 'move';
+  return null;
+}
+
+const MIN_CROP = 40;
+let cropDrag = null; // { mode, startX, startY, origBounds }
+
+function setupCropInteraction() {
+  const canvas = $('crop-canvas');
+  if (!canvas || canvas.dataset.cropBound) return;
+  canvas.dataset.cropBound = '1';
+
+  const startDrag = (evt) => {
+    if (!pendingBounds || !pendingSourceCanvas) return;
+    evt.preventDefault();
+    const pos = canvasPointerPos(canvas, evt);
+    const mode = hitCropHandle(
+      pendingBounds, pos.x, pos.y,
+      pendingSourceCanvas.width, pendingSourceCanvas.height
+    );
+    if (!mode) return;
+    cropDrag = {
+      mode,
+      startX: pos.x,
+      startY: pos.y,
+      orig: { ...pendingBounds }
+    };
+  };
+
+  const moveDrag = (evt) => {
+    if (!cropDrag || !pendingBounds || !pendingSourceCanvas) return;
+    evt.preventDefault();
+    const pos = canvasPointerPos(canvas, evt);
+    const dx = pos.x - cropDrag.startX;
+    const dy = pos.y - cropDrag.startY;
+    const o = cropDrag.orig;
+    const W = pendingSourceCanvas.width;
+    const H = pendingSourceCanvas.height;
+    let { minX, minY, maxX, maxY } = o;
+
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const mode = cropDrag.mode;
+
+    if (mode === 'move') {
+      const bw = maxX - minX;
+      const bh = maxY - minY;
+      minX = clamp(o.minX + dx, 0, W - 1 - bw);
+      minY = clamp(o.minY + dy, 0, H - 1 - bh);
+      maxX = minX + bw;
+      maxY = minY + bh;
+    } else {
+      if (mode.includes('n')) minY = clamp(o.minY + dy, 0, o.maxY - MIN_CROP);
+      if (mode.includes('s')) maxY = clamp(o.maxY + dy, o.minY + MIN_CROP, H - 1);
+      if (mode.includes('w')) minX = clamp(o.minX + dx, 0, o.maxX - MIN_CROP);
+      if (mode.includes('e')) maxX = clamp(o.maxX + dx, o.minX + MIN_CROP, W - 1);
+    }
+
+    pendingBounds = { minX, minY, maxX, maxY, valid: true };
+    drawCropOverlay(pendingSourceCanvas, pendingBounds);
+  };
+
+  const endDrag = () => { cropDrag = null; };
+
+  canvas.addEventListener('mousedown', startDrag);
+  window.addEventListener('mousemove', moveDrag);
+  window.addEventListener('mouseup', endDrag);
+  canvas.addEventListener('touchstart', startDrag, { passive: false });
+  window.addEventListener('touchmove', moveDrag, { passive: false });
+  window.addEventListener('touchend', endDrag);
+
+  // Cursor-Hinweis
+  canvas.addEventListener('mousemove', (evt) => {
+    if (cropDrag || !pendingBounds || !pendingSourceCanvas) return;
+    const pos = canvasPointerPos(canvas, evt);
+    const mode = hitCropHandle(
+      pendingBounds, pos.x, pos.y,
+      pendingSourceCanvas.width, pendingSourceCanvas.height
+    );
+    const cursors = {
+      n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
+      nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+      move: 'move'
+    };
+    canvas.style.cursor = cursors[mode] || 'default';
+  });
+}
+
+/**
+ * Schneidet zu, optional leichte Rotation (geraderücken),
+ * Graustufen + Kontrast → Archiv- & OCR-Bild
+ */
+function applyCropAndEnhance(sourceCanvas, bounds, doCrop = true) {
+  const w = sourceCanvas.width;
+  const h = sourceCanvas.height;
+  const srcCtx = sourceCanvas.getContext('2d');
+
+  let sx = 0, sy = 0, sw = w, sh = h;
+  if (doCrop && bounds.valid) {
+    sx = bounds.minX;
+    sy = bounds.minY;
+    sw = bounds.maxX - bounds.minX + 1;
+    sh = bounds.maxY - bounds.minY + 1;
+  }
+
+  const out = document.createElement('canvas');
+  out.width = sw;
+  out.height = sh;
+  const ctx = out.getContext('2d');
+  ctx.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  // Graustufen + Kontrast
+  const imageData = ctx.getImageData(0, 0, sw, sh);
+  const d = imageData.data;
+  const contrast = 1.6;
+  const intercept = 128 * (1 - contrast);
+  for (let i = 0; i < d.length; i += 4) {
+    let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    gray = contrast * gray + intercept;
+    if (gray < 35) gray *= 0.45;
+    gray = Math.max(0, Math.min(255, gray));
+    d[i] = d[i + 1] = d[i + 2] = gray;
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  return out.toDataURL('image/jpeg', 0.9);
+}
+
+/** OCR nur auf dem bereits zugeschnittenen Bild */
+async function runOCROnImage(dataUrl) {
+  if (getVisionApiKey()) {
+    return runVisionOCR(dataUrl);
+  }
+  const result = await Tesseract.recognize(dataUrl, 'ara+eng+deu', {
+    logger: m => {
+      if (m.status === 'recognizing text') {
+        $('ocr-text').textContent = `Tesseract… ${Math.round(m.progress * 100)}%`;
+      } else if (m.status === 'loading language traineddata') {
+        $('ocr-text').textContent = 'Lade Sprachmodell…';
+      }
+    }
+  });
+  return result?.data?.text || '';
+}
+
+/** Nach Zuschnitt: OCR + Formular füllen */
+async function analyzeCroppedReceipt(processedDataUrl) {
+  currentImageBase64 = processedDataUrl;
+
+  const preview = $('receipt-preview');
+  const cropCanvas = $('crop-canvas');
+  if (cropCanvas) cropCanvas.classList.add('hidden');
+  if (preview) {
+    preview.src = processedDataUrl;
+    preview.classList.remove('hidden');
+  }
+  hide($('crop-actions'));
+
+  show($('ocr-status'));
+  $('ocr-text').textContent = getVisionApiKey()
+    ? 'Google Vision analysiert (nur Beleg)…'
+    : 'Tesseract analysiert (nur Beleg)…';
+
+  let text = '';
+  try {
+    text = await runOCROnImage(processedDataUrl);
+    console.log('OCR Text:', text);
+
+    const rawBox = $('ocr-raw-box');
+    const rawPre = $('ocr-raw-text');
+    if (rawBox && rawPre) {
+      rawPre.textContent = text?.trim() || '(kein brauchbarer Text erkannt)';
+      show(rawBox);
+    }
+
+    const parsed = parseReceiptText(text || '');
+
+    if (parsed.company) $('company').value = parsed.company;
+    if (parsed.gross) $('amount-gross').value = parsed.gross.toFixed(2);
+    if (parsed.net) $('amount-net').value = parsed.net.toFixed(2);
+    if (parsed.vat) $('amount-vat').value = parsed.vat.toFixed(2);
+    if (parsed.date) $('date').value = parsed.date;
+    if (parsed.currency) {
+      const curSelect = $('currency');
+      if (curSelect && ![...curSelect.options].some(o => o.value === parsed.currency)) {
+        const opt = document.createElement('option');
+        opt.value = parsed.currency;
+        opt.textContent = parsed.currency;
+        curSelect.appendChild(opt);
+      }
+      if (curSelect) curSelect.value = parsed.currency;
+    }
+
+    updateEUR();
+
+    const useful = (text || '').replace(/[\s*#\-_=xX.]+/g, '').length;
+    if (useful < 15) {
+      $('ocr-text').textContent = 'Wenig Text erkannt – bitte manuell eingeben';
+    } else {
+      $('ocr-text').textContent = 'Analyse fertig';
+    }
+
+    if (parsed.cardEndings.length > 0) {
+      const methods = await dbGetAll(STORE_PAYMENTS);
+      const match = methods.find(pm => parsed.cardEndings.includes(pm.ending));
+      if (match) {
+        $('suggested-card').textContent = `${match.name} (****${match.ending})`;
+        $('card-suggestion').dataset.pmId = match.id;
+        show($('card-suggestion'));
+      } else {
+        $('suggested-card').textContent = `****${parsed.cardEndings[0]} (noch nicht gespeichert)`;
+        $('card-suggestion').dataset.ending = parsed.cardEndings[0];
+        show($('card-suggestion'));
+      }
+    }
+  } catch (err) {
+    console.error('OCR Fehler', err);
+    $('ocr-text').textContent = 'OCR fehlgeschlagen – bitte manuell eingeben';
+    const rawBox = $('ocr-raw-box');
+    const rawPre = $('ocr-raw-text');
+    if (rawBox && rawPre) {
+      rawPre.textContent = 'Fehler: ' + (err.message || err);
+      show(rawBox);
+    }
+  } finally {
+    setTimeout(() => hide($('ocr-status')), 2500);
+  }
+}
+
+// Zustand für Zuschnitt-Schritt
+let pendingSourceCanvas = null;
+let pendingBounds = null;
+let pendingOriginalDataUrl = null;
 
 function setupUpload() {
   const input = $('receipt-input');
   const area = $('upload-area');
   const placeholder = $('upload-placeholder');
-  const preview = $('receipt-preview');
 
-  area.addEventListener('click', () => input.click());
+  area.addEventListener('click', (e) => {
+    // Klick auf Buttons im Crop-Bereich nicht neu öffnen
+    if (e.target.closest('#crop-actions')) return;
+    if (!$('crop-actions')?.classList.contains('hidden')) return;
+    input.click();
+  });
+
+  $('btn-confirm-crop')?.addEventListener('click', async () => {
+    if (!pendingSourceCanvas || !pendingBounds) return;
+    $('ocr-text') && ($('ocr-text').textContent = 'Schneide zu…');
+    const processed = applyCropAndEnhance(pendingSourceCanvas, pendingBounds, true);
+    pendingSourceCanvas = null;
+    pendingBounds = null;
+    await analyzeCroppedReceipt(processed);
+  });
+
+  $('btn-skip-crop')?.addEventListener('click', async () => {
+    if (!pendingSourceCanvas) return;
+    const fullBounds = {
+      minX: 0, minY: 0,
+      maxX: pendingSourceCanvas.width - 1,
+      maxY: pendingSourceCanvas.height - 1,
+      valid: false
+    };
+    const processed = applyCropAndEnhance(pendingSourceCanvas, fullBounds, false);
+    pendingSourceCanvas = null;
+    pendingBounds = null;
+    await analyzeCroppedReceipt(processed);
+  });
 
   input.addEventListener('change', async (e) => {
     const file = e.target.files[0];
@@ -690,107 +1020,46 @@ function setupUpload() {
     const reader = new FileReader();
     reader.onload = async (ev) => {
       const originalDataUrl = ev.target.result;
+      pendingOriginalDataUrl = originalDataUrl;
       currentImageBase64 = originalDataUrl;
-      preview.src = currentImageBase64;
-      preview.classList.remove('hidden');
-      placeholder.classList.add('hidden');
 
-      // OCR starten
-      show($('ocr-status'));
-      let text = '';
+      hide($('ocr-raw-box'));
+      hide($('card-suggestion'));
+      hide($('ocr-status'));
+
       try {
-        // Beleg aufbereiten (Zuschneiden, Graustufen, Kontrast) – wird gespeichert
-        $('ocr-text').textContent = 'Beleg wird aufbereitet…';
-        const processed = await preprocessImage(originalDataUrl, { forArchive: true });
-        currentImageBase64 = processed; // Archiv-Version speichern
-        preview.src = processed;        // Vorschau aktualisieren
+        show($('ocr-status'));
+        $('ocr-text').textContent = 'Beleg wird gesucht…';
 
-        const hasVision = !!getVisionApiKey();
+        const { canvas } = await loadImageToCanvas(originalDataUrl, 1800);
+        const bounds = detectReceiptBounds(canvas.getContext('2d'), canvas.width, canvas.height);
+        pendingSourceCanvas = canvas;
+        pendingBounds = bounds;
 
-        if (hasVision) {
-          $('ocr-text').textContent = 'Google Vision analysiert…';
-          // Vision: Original oft besser (Farbe/Detail), Fallback auf processed
-          try {
-            text = await runVisionOCR(originalDataUrl);
-          } catch (visionErr) {
-            console.warn('Vision mit Original fehlgeschlagen, versuche aufbereitetes Bild', visionErr);
-            text = await runVisionOCR(processed);
-          }
-        } else {
-          $('ocr-text').textContent = 'Analysiere mit Tesseract…';
-          const result = await Tesseract.recognize(processed, 'ara+eng+deu', {
-            logger: m => {
-              if (m.status === 'recognizing text') {
-                $('ocr-text').textContent = `Tesseract… ${Math.round(m.progress * 100)}%`;
-              } else if (m.status === 'loading language traineddata') {
-                $('ocr-text').textContent = 'Lade Sprachmodell…';
-              }
-            }
-          });
-          text = result?.data?.text || '';
-        }
-        console.log('OCR Text:', text);
+        // Overlay mit ausgegrauten Rändern + ziehbare Griffe
+        drawCropOverlay(canvas, bounds);
+        setupCropInteraction();
 
-        // Rohtext anzeigen
-        const rawBox = $('ocr-raw-box');
-        const rawPre = $('ocr-raw-text');
-        if (rawBox && rawPre) {
-          rawPre.textContent = text?.trim() || '(kein brauchbarer Text erkannt)';
-          show(rawBox);
-        }
+        placeholder.classList.add('hidden');
+        const previewWrap = $('preview-wrap');
+        const cropCanvas = $('crop-canvas');
+        const preview = $('receipt-preview');
+        if (previewWrap) show(previewWrap);
+        if (cropCanvas) cropCanvas.classList.remove('hidden');
+        if (preview) preview.classList.add('hidden');
+        show($('crop-actions'));
 
-        const parsed = parseReceiptText(text || '');
+        hide($('ocr-status'));
 
-        if (parsed.company) $('company').value = parsed.company;
-        if (parsed.gross) $('amount-gross').value = parsed.gross.toFixed(2);
-        if (parsed.net) $('amount-net').value = parsed.net.toFixed(2);
-        if (parsed.vat) $('amount-vat').value = parsed.vat.toFixed(2);
-        if (parsed.date) $('date').value = parsed.date;
-        if (parsed.currency) {
-          const curSelect = $('currency');
-          // Option anlegen falls noch nicht vorhanden
-          if (curSelect && ![...curSelect.options].some(o => o.value === parsed.currency)) {
-            const opt = document.createElement('option');
-            opt.value = parsed.currency;
-            opt.textContent = parsed.currency;
-            curSelect.appendChild(opt);
-          }
-          if (curSelect) curSelect.value = parsed.currency;
-        }
-
-        updateEUR();
-
-        // Hinweis wenn fast nichts erkannt wurde
-        const useful = (text || '').replace(/[\s*#\-_=xX.]+/g, '').length;
-        if (useful < 15) {
-          $('ocr-text').textContent = 'Wenig Text erkannt – bitte manuell eingeben';
-        }
-
-        // Karten-Vorschlag
-        if (parsed.cardEndings.length > 0) {
-          const methods = await dbGetAll(STORE_PAYMENTS);
-          const match = methods.find(pm => parsed.cardEndings.includes(pm.ending));
-          if (match) {
-            $('suggested-card').textContent = `${match.name} (****${match.ending})`;
-            $('card-suggestion').dataset.pmId = match.id;
-            show($('card-suggestion'));
-          } else {
-            $('suggested-card').textContent = `****${parsed.cardEndings[0]} (noch nicht gespeichert)`;
-            $('card-suggestion').dataset.ending = parsed.cardEndings[0];
-            show($('card-suggestion'));
-          }
-        }
+        // Wenn Zuschnitt kaum etwas bringt → optional auto weiter
+        // (User soll bewusst bestätigen)
       } catch (err) {
-        console.error('OCR Fehler', err);
-        $('ocr-text').textContent = 'OCR fehlgeschlagen – bitte manuell eingeben';
-        const rawBox = $('ocr-raw-box');
-        const rawPre = $('ocr-raw-text');
-        if (rawBox && rawPre) {
-          rawPre.textContent = 'Fehler: ' + (err.message || err);
-          show(rawBox);
-        }
-      } finally {
-        setTimeout(() => hide($('ocr-status')), 2500);
+        console.error(err);
+        $('ocr-text').textContent = 'Bild konnte nicht geladen werden';
+        hide($('ocr-status'));
+        // Fallback: direkt OCR auf Original
+        currentImageBase64 = originalDataUrl;
+        await analyzeCroppedReceipt(originalDataUrl);
       }
     };
     reader.readAsDataURL(file);
